@@ -103,4 +103,7 @@ export const http = {
   patch<T>(path: string, body?: unknown, headers?: Record<string, string>): Promise<ApiResponse<T>> {
     return request<T>(path, { method: 'PATCH', body, headers })
   },
+  delete<T>(path: string, headers?: Record<string, string>): Promise<ApiResponse<T>> {
+    return request<T>(path, { method: 'DELETE', headers })
+  },
 }

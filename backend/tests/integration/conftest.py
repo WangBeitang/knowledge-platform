@@ -86,11 +86,29 @@ async def create_user_record(
 
 
 async def cleanup_user(session, user_id: str) -> None:
-    """尽力清理测试用户相关记录（审计 → 会话 → 用户）。"""
-    from sqlalchemy import delete
+    """尽力清理测试用户相关记录（Stage 3 文档映射 → 审计 → 会话 → 用户）。"""
+    from sqlalchemy import delete, select
 
     from app.models.audit_log import AuditLog
     from app.models.auth_session import AuthSession
+    from app.models.document_replacement import DocumentReplacement
+    from app.models.managed_document import ManagedDocument
+    from app.models.rag_integration_task import RagIntegrationTask
+
+    # 先清理该用户创建的文档映射及其关联（FK 顺序：replacements → tasks → documents）
+    doc_ids = select(ManagedDocument.id).where(ManagedDocument.created_by_user_id == user_id)
+    await session.execute(
+        delete(DocumentReplacement).where(
+            (DocumentReplacement.old_managed_document_id.in_(doc_ids))
+            | (DocumentReplacement.new_managed_document_id.in_(doc_ids))
+        )
+    )
+    await session.execute(
+        delete(RagIntegrationTask).where(RagIntegrationTask.managed_document_id.in_(doc_ids))
+    )
+    await session.execute(
+        delete(ManagedDocument).where(ManagedDocument.created_by_user_id == user_id)
+    )
 
     await session.execute(
         delete(AuditLog).where(

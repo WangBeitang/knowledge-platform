@@ -34,6 +34,15 @@ _DATASET_CONFIG_KEYS: dict[str, str] = {
     KnowledgeScope.admin_private.value: "rag_admin_dataset_id",
 }
 
+# 范围 → 原 RAG Document visibility（Stage 3 硬决策 §六）
+# 原 RAG Retrieval 不仅过滤 Dataset，还过滤 public / shared+tenant / owner，
+# 因此平台导入时必须显式指定与范围一致的 visibility。
+_VISIBILITY_FOR_SCOPE: dict[str, str] = {
+    KnowledgeScope.external_public.value: "public",
+    KnowledgeScope.internal_shared.value: "shared",
+    KnowledgeScope.admin_private.value: "private",
+}
+
 # 角色 → 上游固定服务身份配置键
 _SERVICE_USER_CONFIG_KEYS: dict[str, str] = {
     UserRole.admin.value: "rag_service_user_admin",
@@ -61,6 +70,14 @@ def dataset_id_for_scope(scope: str) -> str:
 def dataset_ids_for_role(role: str) -> list[str]:
     """返回角色可访问的 Dataset ID 列表（保持范围顺序）。"""
     return [dataset_id_for_scope(scope) for scope in scopes_for_role(role)]
+
+
+def document_visibility_for_scope(scope: str) -> str:
+    """返回范围对应的原 RAG Document visibility（public/shared/private）。"""
+    visibility = _VISIBILITY_FOR_SCOPE.get(scope)
+    if visibility is None:
+        raise ValueError(f"未知知识范围: {scope}")
+    return visibility
 
 
 def service_user_for_role(role: str) -> str:

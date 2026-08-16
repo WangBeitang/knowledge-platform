@@ -80,3 +80,106 @@ export interface BootstrapData {
   datasets: RagDatasetStatusItem[]
   overall: string
 }
+
+// ========== Stage 3：知识管理 ==========
+
+export type KnowledgeScope = 'external_public' | 'internal_shared' | 'admin_private'
+
+export type PlatformStatus = 'importing' | 'active' | 'import_failed' | 'replaced' | 'deleted'
+
+export interface ManagedDocumentView {
+  id: string
+  rag_document_id: string
+  rag_dataset_id: string
+  knowledge_scope: KnowledgeScope
+  file_name: string
+  source_kind: string
+  index_version: number
+  rag_status: string
+  rag_parse_status: string | null
+  rag_index_status: string | null
+  platform_status: PlatformStatus
+  chunk_count: number
+  latest_rag_task_id: string | null
+  error_code: string | null
+  error_message: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface ImportErrorBody {
+  code: string
+  message: string
+  retryable: boolean
+}
+
+export interface DocumentImportItem {
+  file_name: string
+  document_id: string | null
+  task_id: string | null
+  status: 'pending' | 'rejected'
+  error: ImportErrorBody | null
+}
+
+export interface DocumentImportData {
+  knowledge_scope: string
+  submitted_count: number
+  rejected_count: number
+  items: DocumentImportItem[]
+}
+
+export interface IntegrationTaskView {
+  id: string
+  operation: string
+  status: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  document_id: string | null
+  rag_status: string | null
+  done_nodes: Record<string, unknown>[]
+  running_nodes: Record<string, unknown>[]
+  failed_node: string | null
+  error_code: string | null
+  error_message: string | null
+  started_at: string | null
+  finished_at: string | null
+  updated_at: string | null
+}
+
+export interface RebuildData {
+  task_id: string
+  document_id: string
+  operation: string
+  status: string
+}
+
+export interface ReplaceData {
+  task_id: string
+  new_document_id: string
+  replacement_id: string
+  status: string
+}
+
+export interface ChunkView {
+  chunk_id: string
+  document_id: string
+  index_version: number
+  position: number
+  text: string
+  enabled: boolean
+  disabled_reason_code: string | null
+  disabled_reason_text: string | null
+  metadata: Record<string, unknown>
+}
+
+export interface ChunkListData {
+  items: ChunkView[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface ChunkSetEnabledData {
+  document_id: string
+  chunk_id: string
+  index_version: number
+  enabled: boolean
+}

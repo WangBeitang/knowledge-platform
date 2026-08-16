@@ -1,4 +1,7 @@
-"""RAG 集成 DTO（仅管理员）：状态查询与 Dataset 初始化（《API 接口设计》§6）。"""
+"""RAG 集成 DTO（仅管理员）：状态查询、Dataset 初始化、任务查询（《API 接口设计》§6）。"""
+
+from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -41,4 +44,26 @@ class BootstrapData(BaseModel):
 
 
 class BootstrapResponse(ApiResponse[BootstrapData]):
+    pass
+
+
+class IntegrationTaskView(BaseModel):
+    """平台任务视图（前端轮询平台 task_id，不接触上游 ID）。"""
+
+    id: str
+    operation: str
+    status: str
+    document_id: str | None = None
+    rag_status: str | None = None
+    done_nodes: list[Any] = []
+    running_nodes: list[Any] = []
+    failed_node: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class IntegrationTaskResponse(ApiResponse[IntegrationTaskView]):
     pass

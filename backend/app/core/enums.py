@@ -119,6 +119,11 @@ class AuditAction(StrEnum):
     user_updated = "user_updated"
     user_password_reset = "user_password_reset"
     dataset_bootstrap = "dataset_bootstrap"
+    document_import = "document_import"
+    document_rebuild = "document_rebuild"
+    document_replace = "document_replace"
+    document_delete = "document_delete"
+    chunk_status_changed = "chunk_status_changed"
 
 
 class AuditResult(StrEnum):

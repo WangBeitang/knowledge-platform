@@ -176,6 +176,81 @@ class RagImportClient:
             raise rag_bad_response("上游成员响应缺少 user_id")
         return payload
 
+    # ---------- 上传与任务状态（Stage 3）----------
+
+    async def upload_file(
+        self,
+        *,
+        file_name: str,
+        file_bytes: bytes,
+        dataset_id: str,
+        visibility: str,
+        service_user: str,
+    ) -> dict:
+        """POST /upload：单文件上传，创建原 RAG 导入任务。
+
+        契约校验（§十四）：task_ids/document_ids 必须各恰有一个非空 ID；
+        dataset_id 必须与请求一致；index_version 必须为整数。
+        不自动重试：断线时无法确定上游是否已接收，重试可能重复创建。
+        返回 {rag_task_id, rag_document_id, index_version}。
+        """
+        files = {"files": (file_name, file_bytes, "application/pdf")}
+        data = {"dataset_id": dataset_id, "visibility": visibility}
+        try:
+            resp = await self._client.post(
+                f"{self.base_url}/upload",
+                headers={"X-User-Id": service_user},
+                files=files,
+                data=data,
+            )
+        except httpx.HTTPError as exc:
+            raise map_http_error(exc) from exc
+        if resp.status_code == 404:
+            raise rag_bad_response("上游 Dataset 不存在或不可写")
+        if resp.status_code != 200:
+            raise self._unexpected_status(resp)
+        payload = parse_json_response(resp)
+
+        task_ids = payload.get("task_ids")
+        document_ids = payload.get("document_ids")
+        if not (isinstance(task_ids, list) and len(task_ids) == 1 and str(task_ids[0]).strip()):
+            raise rag_bad_response("上游上传响应缺少唯一 task_id")
+        if not (
+            isinstance(document_ids, list)
+            and len(document_ids) == 1
+            and str(document_ids[0]).strip()
+        ):
+            raise rag_bad_response("上游上传响应缺少唯一 document_id")
+        if str(payload.get("dataset_id") or "") != dataset_id:
+            raise rag_bad_response("上游上传返回的 dataset_id 与请求不一致")
+        index_version = payload.get("index_version")
+        if not isinstance(index_version, int) or index_version < 0:
+            raise rag_bad_response("上游上传响应缺少有效的 index_version")
+        return {
+            "rag_task_id": str(task_ids[0]),
+            "rag_document_id": str(document_ids[0]),
+            "index_version": index_version,
+        }
+
+    async def get_task_status(self, rag_task_id: str, *, service_user: str) -> dict | None:
+        """GET /status/{rag_task_id}：查询导入任务状态（GET 读取规则：网络错误重试）。
+
+        404 表示上游任务不存在（可能已清理）→ 返回 None，由服务层按平台语义处理。
+        返回上游原始字段：status/done_list/running_list/failed_node/error_code/error_message。
+        """
+        resp = await self._get_with_retry(
+            f"{self.base_url}/status/{quote(rag_task_id, safe='')}",
+            service_user=service_user,
+        )
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise self._unexpected_status(resp)
+        payload = parse_json_response(resp)
+        if not str(payload.get("task_id") or "").strip():
+            raise rag_bad_response("上游任务状态响应缺少 task_id")
+        return payload
+
     # ---------- 通用 ----------
 
     def _unexpected_status(self, resp: httpx.Response) -> rag_bad_response.__class__:
