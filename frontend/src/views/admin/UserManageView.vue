@@ -1,11 +1,16 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRouter } from 'vue-router'
 
 import { ApiError } from '@/api/client'
 import * as usersApi from '@/api/users'
+import { useAuthStore } from '@/stores/auth'
 import type { UserView } from '@/types/api'
 import { formatDateTime } from '@/utils/format'
+
+const router = useRouter()
+const auth = useAuthStore()
 
 const loading = ref(false)
 const items = ref<UserView[]>([])
@@ -88,13 +93,25 @@ function openEdit(row: UserView): void {
 async function handleEdit(): Promise<void> {
   editSaving.value = true
   try {
-    await usersApi.updateUser(editingId.value, {
+    const updated = await usersApi.updateUser(editingId.value, {
       display_name: editForm.display_name,
       role: editForm.role,
       status: editForm.status,
     })
-    ElMessage.success('用户信息已更新')
     editDialogVisible.value = false
+
+    // 修改的是当前登录用户：以数据库为准同步 Pinia 身份
+    if (updated.data.id === auth.user?.id) {
+      await auth.restore()
+      if (auth.user?.role !== 'admin') {
+        // 自我降权：后端下一请求已按 employee 鉴权，立即切换到员工落地页
+        ElMessage.info('角色已变更，当前账号已切换为员工权限')
+        await router.replace('/home')
+        return // 不再 fetchUsers，避免无意义的 /admin/users 403
+      }
+    }
+
+    ElMessage.success('用户信息已更新')
     await fetchUsers()
   } catch (err) {
     ElMessage.error(err instanceof ApiError ? err.message : '更新失败')
@@ -140,6 +157,14 @@ async function handleResetPassword(row: UserView): Promise<void> {
       },
     )
     await usersApi.resetUserPassword(row.id, value)
+
+    // 重置的是当前登录用户自己：后端已撤销全部会话，当前 JWT 失效，必须退出
+    if (row.id === auth.user?.id) {
+      ElMessage.success('密码已重置，请使用新密码重新登录')
+      auth.clearSession()
+      await router.replace('/login')
+      return
+    }
     ElMessage.success('密码已重置')
   } catch (err) {
     if (err instanceof ApiError) {
