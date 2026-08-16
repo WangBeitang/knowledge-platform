@@ -32,6 +32,9 @@ async def lifespan(app: FastAPI):
     yield
     await close_engine()
     await close_redis()
+    from app.rag.rag_import_client import close_rag_import_client
+
+    await close_rag_import_client()
 
 
 def create_app() -> FastAPI:

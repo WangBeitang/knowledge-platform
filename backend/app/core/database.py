@@ -42,10 +42,19 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:
-    """FastAPI 依赖：请求级会话。"""
+    """FastAPI 依赖：请求级会话。
+
+    请求正常结束统一 commit（写操作落库）；异常时 rollback 并向上抛出，
+    避免请求内写操作因未提交而静默丢失。
+    """
     factory = get_session_factory()
     async with factory() as session:
-        yield session
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def close_engine() -> None:

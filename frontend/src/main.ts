@@ -1,5 +1,20 @@
+import { createPinia } from 'pinia'
 import { createApp } from 'vue'
 
-import App from './App.vue'
+import ElementPlus from 'element-plus'
+import zhCn from 'element-plus/es/locale/lang/zh-cn'
+import 'element-plus/dist/index.css'
 
-createApp(App).mount('#app')
+import App from './App.vue'
+import router from './router'
+import { useAuthStore } from './stores/auth'
+
+const app = createApp(App)
+app.use(createPinia())
+app.use(router)
+app.use(ElementPlus, { locale: zhCn })
+app.mount('#app')
+
+// 恢复登录态（刷新后拉取当前用户）
+const auth = useAuthStore()
+void auth.restore()

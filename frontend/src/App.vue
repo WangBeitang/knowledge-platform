@@ -1,52 +1,47 @@
 <script setup lang="ts">
-// 阶段 1 骨架冒烟：仅用于验证前后端连通（健康检查），非正式页面。
-// 正式页面（登录/看板/问答等）须通过前端设计门禁后按阶段 2+ 开发。
-import { onMounted, ref } from 'vue'
-
-interface ReadyData {
-  status: string
-  components: Record<string, { status: string }>
-}
-
-const ready = ref<ReadyData | null>(null)
-const error = ref<string>('')
-
-async function checkHealth(): Promise<void> {
-  try {
-    const resp = await fetch('/api/v1/health/ready')
-    const body = await resp.json()
-    ready.value = body.data
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
-  }
-}
-
-onMounted(checkHealth)
+// 平台根组件：仅承载路由出口与全局浅色蓝灰视觉基线。
 </script>
 
 <template>
-  <main style="max-width: 720px; margin: 80px auto; font-family: system-ui, sans-serif">
-    <h1>券商财富业务知识管理平台</h1>
-    <p>工程基线已就绪（阶段 1）。正式页面开发前需先确认视觉风格与原型。</p>
-    <section
-      v-if="error"
-      style="color: #c0392b"
-    >
-      健康检查失败：{{ error }}
-    </section>
-    <section v-else-if="ready">
-      <p>整体状态：{{ ready.status }}</p>
-      <ul>
-        <li
-          v-for="(comp, name) in ready.components"
-          :key="name"
-        >
-          {{ name }}：{{ comp.status }}
-        </li>
-      </ul>
-    </section>
-    <section v-else>
-      正在检查服务状态…
-    </section>
-  </main>
+  <div class="app-root">
+    <router-view />
+  </div>
 </template>
+
+<style>
+:root {
+  /* 低饱和蓝灰体系（G1 已确认：企业后台浅色、专业克制） */
+  --kp-primary: #3d5a80;
+  --kp-primary-light: #eef2f7;
+  --kp-primary-hover: #33506f;
+  --kp-bg: #f5f7fa;
+  --kp-surface: #ffffff;
+  --kp-border: #e2e8f0;
+  --kp-text: #1f2d3d;
+  --kp-text-secondary: #5c6b7a;
+  --kp-danger: #c0504d;
+  --kp-success: #2e7d5b;
+  --el-color-primary: #3d5a80;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  background: var(--kp-bg);
+  color: var(--kp-text);
+}
+
+.app-root {
+  height: 100%;
+}
+</style>

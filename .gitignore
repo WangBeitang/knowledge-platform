@@ -38,3 +38,4 @@ Thumbs.db
 # 日志
 *.log
 logs/
+vite.config.ts.timestamp-*.mjs

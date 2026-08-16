@@ -110,3 +110,17 @@ class LogStatus(StrEnum):
 class SourceKind(StrEnum):
     manual_upload = "manual_upload"
     faq_generated = "faq_generated"
+
+
+class AuditAction(StrEnum):
+    """审计稳定动作枚举（阶段 2 最小集，阶段 5 扩展）。"""
+
+    user_created = "user_created"
+    user_updated = "user_updated"
+    user_password_reset = "user_password_reset"
+    dataset_bootstrap = "dataset_bootstrap"
+
+
+class AuditResult(StrEnum):
+    succeeded = "succeeded"
+    failed = "failed"
