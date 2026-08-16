@@ -1,8 +1,15 @@
-/** 路由：登录页 + 平台布局；未登录 → 登录页；员工隐藏管理菜单（前端隐藏，后端仍强制校验）。 */
+/** 路由：登录页 + 平台布局；守卫以 Pinia auth store 为登录态事实来源。
+
+守卫规则：
+1. 若 auth 尚未完成 restore，先 await auth.restore()（避免旧 token/旧 role 竞态）；
+2. 无 token 访问保护页 → /login；
+3. admin 路由判断用 auth.user.role，不再读取独立的 kp_role；
+4. 前端隐藏/跳转只是 UX，后端鉴权仍是最终事实来源。
+*/
 
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
-import { getStoredToken } from '@/api/client'
+import { useAuthStore } from '@/stores/auth'
 
 const routes: RouteRecordRaw[] = [
   {
@@ -50,20 +57,21 @@ const router = createRouter({
   routes,
 })
 
-router.beforeEach((to) => {
-  const token = getStoredToken()
-  if (to.meta.public) {
-    return token ? { path: '/' } : true
+router.beforeEach(async (to) => {
+  const auth = useAuthStore()
+  // 登录态尚未恢复：先 restore（/auth/me 失败会清登录态），再决定放行
+  if (!auth.ready) {
+    await auth.restore()
   }
-  if (!token) {
+  if (to.meta.public) {
+    return auth.token ? { path: '/' } : true
+  }
+  if (!auth.token) {
     return { path: '/login', query: { redirect: to.fullPath } }
   }
-  // 员工访问管理路由：前端重定向（后端鉴权仍是事实来源）
-  if (to.meta.adminOnly) {
-    const role = localStorage.getItem('kp_role')
-    if (role !== 'admin') {
-      return { path: '/home' }
-    }
+  // 员工访问管理路由：前端跳转非管理落地页（后端鉴权仍是事实来源）
+  if (to.meta.adminOnly && auth.user?.role !== 'admin') {
+    return { path: '/home' }
   }
   return true
 })

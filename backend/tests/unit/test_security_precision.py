@@ -1,17 +1,21 @@
 """JWT iat 与 password_changed_at 精度边界回归测试（DATETIME(6) vs 秒级 iat）。
 
-验证目标（冻结 §3.1）：
-- 重置前的旧 Token 立即失效（含同秒场景）；
-- 重置后同秒重新登录的新 Token 不被误判为旧 Token；
-- 数据库读出的无时区时间按 UTC 处理，不受服务器本地时区影响。
+规则（复核修复后）：
+- JWT `iat` 为真实签发秒（不制造未来时间），PyJWT 标准 `verify_iat` 保持开启；
+- 同秒边界用 `auth_sessions.issued_at`（DATETIME(6) 微秒）判定：
+  1. iat 明显早于 password_changed_at 所在秒 → 旧 Token；
+  2. 明显晚于 → 新 Token；
+  3. 同秒 → session.issued_at < password_changed_at → 旧 Token。
 """
 
 from datetime import UTC, datetime
 
+import jwt as pyjwt
 import pytest
 
 from app.core.security import (
     create_access_token,
+    decode_access_token,
     is_iat_before_password_change,
 )
 from app.core.time import utc_now_naive
@@ -37,78 +41,81 @@ def _dt(day_second: float, *, naive: bool = True) -> datetime:
 
 
 def _epoch_of(dt: datetime) -> float:
-    """按“无时区时间视为 UTC”的约定计算 epoch（与校验函数语义一致）。"""
+    """按“无时区时间视为 UTC”的约定计算 epoch（与判定函数语义一致）。"""
     return dt.replace(tzinfo=UTC).timestamp()
 
 
 class TestIssuedBeforePasswordChange:
     def test_old_token_same_second_is_rejected(self):
-        # 签发于 12:00:00.200，重置于 12:00:00.500（同秒）
+        # 签发 12:00:00.200，重置 12:00:00.500（同秒）：会话签发早于变更 → 旧
         pca = _dt(12 * 3600 + 0.5)
-        old_iat = int(_epoch_of(_dt(12 * 3600 + 0.2)))
-        assert is_iat_before_password_change(old_iat, pca) is True
+        issued_at = _dt(12 * 3600 + 0.2)
+        iat = int(_epoch_of(_dt(12 * 3600 + 0.2)))
+        assert is_iat_before_password_change(iat, issued_at, pca) is True
 
     def test_old_token_cross_second_is_rejected(self):
         pca = _dt(12 * 3600 + 0.5)
-        assert is_iat_before_password_change(int(_epoch_of(pca)) - 1, pca) is True
+        issued_at = _dt(12 * 3600 - 1 + 0.3)  # 上一秒签发
+        iat = int(_epoch_of(issued_at))
+        assert is_iat_before_password_change(iat, issued_at, pca) is True
 
-    def test_new_token_after_change_is_valid(self):
+    def test_new_token_same_second_after_change_is_valid(self):
+        # 重置 12:00:00.500，同秒（12:00:00.700）重新登录：会话签发晚于变更 → 新
         pca = _dt(12 * 3600 + 0.5)
-        # 重置后（12:00:02 秒）签发的新 Token 不应被拒绝
-        assert is_iat_before_password_change(int(_epoch_of(pca)) + 2, pca) is False
+        issued_at = _dt(12 * 3600 + 0.7)
+        iat = int(_epoch_of(issued_at))
+        assert is_iat_before_password_change(iat, issued_at, pca) is False
+
+    def test_new_token_cross_second_is_valid(self):
+        pca = _dt(12 * 3600 + 0.5)
+        issued_at = _dt(12 * 3600 + 2.3)
+        iat = int(_epoch_of(issued_at))
+        assert is_iat_before_password_change(iat, issued_at, pca) is False
 
     def test_whole_second_boundary(self):
-        pca = _dt(12 * 3600, naive=True)  # 恰为整秒 12:00:00.000000
-        assert is_iat_before_password_change(int(_epoch_of(pca)) - 1, pca) is True
-        assert is_iat_before_password_change(int(_epoch_of(pca)), pca) is False
+        # pca 恰为整秒 12:00:00.000000；上一秒签发的 token 必为旧
+        pca = _dt(12 * 3600, naive=True)
+        issued_old = _dt(12 * 3600 - 1 + 0.5)
+        assert is_iat_before_password_change(int(_epoch_of(issued_old)), issued_old, pca) is True
+        # 整秒后（12:00:01）签发 → 新
+        issued_new = _dt(12 * 3600 + 1 + 0.2)
+        assert is_iat_before_password_change(int(_epoch_of(issued_new)), issued_new, pca) is False
 
 
-class TestCreateTokenSameSecond:
-    def _token_iat(self, *, now_ts: float, pca: datetime) -> int:
-        class FakeTime:
-            @staticmethod
-            def time() -> float:
-                return now_ts
+class TestIatIsRealAndStandardVerify:
+    def test_iat_is_real_second_not_future(self):
+        """iat 必须是真实签发秒，不允许人为 +1 制造未来时间。"""
+        import time as _time
 
-        monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setattr("app.core.security.time.time", FakeTime.time)
-        try:
-            token, _exp = create_access_token(
-                user_id="u1",
-                session_id="s1",
-                jti="j1",
-                role="admin",
-                password_changed_at=pca,
-            )
-            import jwt as _jwt
+        token, _exp = create_access_token(
+            user_id="u1",
+            session_id="s1",
+            jti="j1",
+            role="admin",
+        )
+        payload = decode_access_token(token)
+        assert payload["iat"] == int(_time.time())
+        assert payload["iat"] <= int(_time.time())  # 不超前
 
-            from app.core.config import get_settings
+    def test_standard_iat_verification_enabled(self):
+        """decode 恢复 PyJWT 标准 iat 校验：伪造未来 iat 的 token 必须被拒。"""
+        from app.core.config import get_settings
 
-            payload = _jwt.decode(token, get_settings().secret_key, algorithms=["HS256"])
-            return int(payload["iat"])
-        finally:
-            monkeypatch.undo()
-
-    def test_same_second_login_bumps_iat(self):
-        # 重置于 12:00:00.500，同秒（12:00:00.700）登录：iat 提升到下一秒，避免误判
-        pca = _dt(12 * 3600 + 0.5)
-        now_ts = _epoch_of(_dt(12 * 3600 + 0.7))
-        iat = self._token_iat(now_ts=now_ts, pca=pca)
-        assert iat == int(_epoch_of(pca)) + 1
-        assert is_iat_before_password_change(iat, pca) is False  # 新 Token 有效
-
-    def test_cross_second_login_no_bump(self):
-        pca = _dt(12 * 3600 + 0.5)
-        now_ts = _epoch_of(_dt(12 * 3600 + 2.3))
-        iat = self._token_iat(now_ts=now_ts, pca=pca)
-        assert iat == int(_epoch_of(pca)) + 2
-        assert is_iat_before_password_change(iat, pca) is False
-
-    def test_no_password_change_no_bump(self):
-        pca = _dt(9 * 3600)  # 很久以前
-        now_ts = _epoch_of(_dt(12 * 3600 + 0.9))
-        iat = self._token_iat(now_ts=now_ts, pca=pca)
-        assert iat == int(_epoch_of(_dt(12 * 3600 + 0.9)))
+        future_iat = int(__import__("time").time()) + 60
+        forged = pyjwt.encode(
+            {
+                "sub": "u1",
+                "sid": "s1",
+                "jti": "j1",
+                "role": "admin",
+                "iat": future_iat,
+                "exp": future_iat + 3600,
+            },
+            get_settings().secret_key,
+            algorithm="HS256",
+        )
+        with pytest.raises(pyjwt.ImmatureSignatureError):
+            decode_access_token(forged)
 
 
 class TestNaiveUtcHandling:
@@ -117,8 +124,9 @@ class TestNaiveUtcHandling:
         pca = utc_now_naive()
         import time as _time
 
+        issued_at = utc_now_naive()
         past_iat = int(_time.time()) - 2
-        assert is_iat_before_password_change(past_iat, pca) is True
+        assert is_iat_before_password_change(past_iat, issued_at, pca) is True
 
         future_iat = int(_time.time()) + 2
-        assert is_iat_before_password_change(future_iat, pca) is False
+        assert is_iat_before_password_change(future_iat, issued_at, pca) is False

@@ -50,15 +50,28 @@ async function handleBootstrap(verifyOnly: boolean): Promise<void> {
     const resp = await integrationApi.bootstrapRag(verifyOnly)
     datasets.value = resp.data.datasets
     overall.value = resp.data.overall
-    ElMessage.success(
-      verifyOnly
-        ? '校验完成（本次只查询，未修改任何上游状态）'
-        : `初始化完成：${resp.data.overall}`,
-    )
+    showBootstrapResult(verifyOnly, resp.data.overall)
   } catch (err) {
     errorMessage.value = err instanceof ApiError ? err.message : `${mode}失败`
   } finally {
     busy.value = false
+  }
+}
+
+/** 按真实结果分色提示：succeeded/ok → success；partial → warning；failed → error。 */
+function showBootstrapResult(verifyOnly: boolean, overall: string): void {
+  if (overall === 'succeeded' || overall === 'ok') {
+    ElMessage.success(
+      verifyOnly ? '校验完成，三档状态正常（本次只查询，未修改任何上游状态）' : '初始化完成',
+    )
+  } else if (overall === 'partial') {
+    ElMessage.warning(
+      verifyOnly
+        ? '校验完成，但存在缺失项，未做任何修改'
+        : '初始化完成，但存在部分缺失或角色不符',
+    )
+  } else {
+    ElMessage.error(verifyOnly ? '校验失败，请检查上游服务' : '初始化失败，请检查上游服务')
   }
 }
 

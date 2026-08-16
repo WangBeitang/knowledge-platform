@@ -9,9 +9,14 @@
   role ∈ viewer|editor|admin；owner 不允许通过 members API 修改；
 - 所有请求必须携带 `X-User-Id`（固定服务身份），缺失 → 400。
 
+重试策略（SPEC §5.4 冻结）：GET 类读取（列表/详情）网络错误最多重试 2 次（首次 + 2，
+总 3 次），指数退避；POST 创建/upsert **不自动重试**——连接断开时无法确定写操作是否
+已被上游接收，重试可能造成重复副作用。
+
 Base URL 只从 Settings 读取；route/service 禁止拼上游 URL。
 """
 
+import asyncio
 from urllib.parse import quote
 
 import httpx
@@ -27,12 +32,13 @@ from app.rag.rag_errors import (
 # 读取权限通过显式成员（固定服务身份）控制，避免 public 扩大暴露面。
 DATASET_VISIBILITY_PRIVATE = "private"
 
-# Dataset 成员角色（原 RAG 契约）
-MEMBER_ROLE_VIEWER = "viewer"
+# GET 网络类错误重试：总尝试 3 次（首次 + 2 次重试），指数退避基数（秒）
+GET_MAX_ATTEMPTS = 3
+GET_RETRY_BACKOFF_BASE = 0.1
 
 
 class RagImportClient:
-    """原 RAG 导入服务适配客户端（HTTPX，含超时与连接池）。"""
+    """原 RAG 导入服务适配客户端（HTTPX，含超时、连接池与 GET 有限重试）。"""
 
     def __init__(
         self,
@@ -40,8 +46,12 @@ class RagImportClient:
         base_url: str | None = None,
         timeout: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        retry_attempts: int = GET_MAX_ATTEMPTS,
+        retry_backoff_base: float = GET_RETRY_BACKOFF_BASE,
     ) -> None:
         self.base_url = (base_url or get_settings().rag_import_base_url).rstrip("/")
+        self.retry_attempts = retry_attempts
+        self.retry_backoff_base = retry_backoff_base
         self._client = httpx.AsyncClient(
             transport=transport,
             timeout=httpx.Timeout(timeout=timeout, connect=5.0),
@@ -52,17 +62,34 @@ class RagImportClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    # ---------- 通用：GET 有限重试 ----------
+
+    async def _get_with_retry(self, url: str, *, service_user: str) -> httpx.Response:
+        """GET 请求：网络类错误（连接/读取超时等）指数退避重试，最多 `retry_attempts` 次。
+
+        状态码异常不在此重试（由调用方按业务语义处理 404 / 非预期状态）。
+        """
+        headers = {"X-User-Id": service_user}
+        last_exc: httpx.HTTPError | None = None
+        for attempt in range(self.retry_attempts):
+            try:
+                return await self._client.get(url, headers=headers)
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                if attempt < self.retry_attempts - 1:
+                    await asyncio.sleep(self.retry_backoff_base * (2**attempt))
+        # 全部重试仍失败：按最终异常类型映射稳定错误码
+        assert last_exc is not None
+        raise map_http_error(last_exc) from last_exc
+
     # ---------- Dataset ----------
 
     async def get_dataset(self, dataset_id: str, *, service_user: str) -> dict | None:
         """GET /datasets/{id}：存在返回响应体，不存在（404）返回 None，异常映射。"""
-        try:
-            resp = await self._client.get(
-                f"{self.base_url}/datasets/{quote(dataset_id, safe='')}",
-                headers={"X-User-Id": service_user},
-            )
-        except httpx.HTTPError as exc:
-            raise map_http_error(exc) from exc
+        resp = await self._get_with_retry(
+            f"{self.base_url}/datasets/{quote(dataset_id, safe='')}",
+            service_user=service_user,
+        )
         if resp.status_code == 404:
             return None
         if resp.status_code != 200:
@@ -81,7 +108,11 @@ class RagImportClient:
         visibility: str = DATASET_VISIBILITY_PRIVATE,
         service_user: str,
     ) -> dict:
-        """POST /datasets：创建 Dataset。重复 dataset_id 由上游抛错，不静默当作成功。"""
+        """POST /datasets：创建 Dataset。
+
+        不自动重试：连接断开时无法确定创建是否已被上游接收，重试可能重复创建；
+        重复 dataset_id 由上游抛错，不静默当作成功。
+        """
         try:
             resp = await self._client.post(
                 f"{self.base_url}/datasets",
@@ -106,13 +137,10 @@ class RagImportClient:
 
     async def list_dataset_members(self, dataset_id: str, *, service_user: str) -> list[dict]:
         """GET /datasets/{id}/members：返回成员列表（空列表表示无显式成员）。"""
-        try:
-            resp = await self._client.get(
-                f"{self.base_url}/datasets/{quote(dataset_id, safe='')}/members",
-                headers={"X-User-Id": service_user},
-            )
-        except httpx.HTTPError as exc:
-            raise map_http_error(exc) from exc
+        resp = await self._get_with_retry(
+            f"{self.base_url}/datasets/{quote(dataset_id, safe='')}/members",
+            service_user=service_user,
+        )
         if resp.status_code != 200:
             raise self._unexpected_status(resp)
         payload = parse_json_response(resp)
@@ -129,7 +157,10 @@ class RagImportClient:
         role: str,
         operator_service_user: str,
     ) -> dict:
-        """POST /datasets/{id}/members：新增/更新成员（上游 upsert，幂等）。"""
+        """POST /datasets/{id}/members：新增/更新成员（上游 upsert，幂等）。
+
+        写操作不自动重试（保守原则）：即使失败也由调用方显式重试/校验。
+        """
         try:
             resp = await self._client.post(
                 f"{self.base_url}/datasets/{quote(dataset_id, safe='')}/members",
@@ -156,7 +187,7 @@ _shared_client: RagImportClient | None = None
 
 
 def get_rag_import_client() -> RagImportClient:
-    """共享客户端（应用内复用连接池）。"""
+    """共享客户端（应用内复用连接池；lifespan shutdown 统一关闭）。"""
     global _shared_client
     if _shared_client is None:
         _shared_client = RagImportClient()

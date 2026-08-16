@@ -7,10 +7,22 @@ verify_only=true 零写副作用、HTTP 端点真实调用。
 import json
 
 import httpx
+import pytest
 
 from app.rag.rag_import_client import RagImportClient
 from app.services.bootstrap_service import BootstrapService
 from tests.integration.conftest import api_login, bearer_headers
+
+# 测试注入的 MockTransport client 统一在用例结束后显式关闭，避免 ResourceWarning
+_test_clients: list[RagImportClient] = []
+
+
+@pytest.fixture(autouse=True)
+async def _close_test_clients():
+    yield
+    while _test_clients:
+        client = _test_clients.pop()
+        await client.aclose()
 
 
 class FakeRag:
@@ -21,6 +33,22 @@ class FakeRag:
         self.members: dict[tuple[str, str], dict] = {}
         self.create_calls = 0
         self.upsert_calls = 0
+
+    def seed_dataset(self, dataset_id: str, *, owner_user_id: str = "svc_knowledge_admin") -> None:
+        self.datasets[dataset_id] = {
+            "dataset_id": dataset_id,
+            "name": dataset_id,
+            "owner_user_id": owner_user_id,
+            "visibility": "private",
+            "document_count": 0,
+        }
+
+    def seed_member(self, dataset_id: str, user_id: str, role: str) -> None:
+        self.members[(dataset_id, user_id)] = {
+            "dataset_id": dataset_id,
+            "user_id": user_id,
+            "role": role,
+        }
 
     async def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -82,11 +110,11 @@ class FakeRag:
 
 
 def _fake_service(fake: FakeRag) -> BootstrapService:
-    return BootstrapService(
-        client=RagImportClient(
-            base_url="http://rag-stub", transport=httpx.MockTransport(fake.handler)
-        )
+    client = RagImportClient(
+        base_url="http://rag-stub", transport=httpx.MockTransport(fake.handler)
     )
+    _test_clients.append(client)
+    return BootstrapService(client=client)
 
 
 class TestBootstrapIdempotency:
@@ -155,11 +183,11 @@ class TestBootstrapIdempotency:
         async def failing_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(500, text="<html>boom</html>")
 
-        service = BootstrapService(
-            client=RagImportClient(
-                base_url="http://rag-stub", transport=httpx.MockTransport(failing_handler)
-            )
+        client = RagImportClient(
+            base_url="http://rag-stub", transport=httpx.MockTransport(failing_handler)
         )
+        _test_clients.append(client)
+        service = BootstrapService(client=client)
         items, overall, result = await service.bootstrap_datasets(
             verify_only=False, operator_user_id="op-1"
         )
@@ -177,10 +205,12 @@ class TestBootstrapHttp:
         fake = FakeRag()
 
         def fake_factory(session):
+            client = RagImportClient(
+                base_url="http://rag-stub", transport=httpx.MockTransport(fake.handler)
+            )
+            _test_clients.append(client)
             return BootstrapService(
-                client=RagImportClient(
-                    base_url="http://rag-stub", transport=httpx.MockTransport(fake.handler)
-                ),
+                client=client,
                 audit_service=AuditService(AuditLogRepository(session)),
             )
 
@@ -227,3 +257,109 @@ class TestBootstrapHttp:
             "internal_shared": "exists",
             "admin_private": "exists",
         }
+
+
+class TestMemberRoleVerification:
+    """member 必须 user_id + role 都匹配才算 verified（§三）。"""
+
+    @staticmethod
+    def _seeded_fake_with_wrong_role() -> tuple[FakeRag, BootstrapService]:
+        fake = FakeRag()
+        for ds in (
+            "securities_external_public",
+            "securities_internal_shared",
+            "securities_admin_private",
+        ):
+            fake.seed_dataset(ds)
+        # internal_shared 成员正确（viewer）；external_public 成员 role 错误
+        # （应为 viewer，实际 editor）
+        fake.seed_member("securities_internal_shared", "svc_knowledge_employee", "viewer")
+        fake.seed_member("securities_external_public", "svc_knowledge_employee", "editor")
+        return fake, _fake_service(fake)
+
+    async def test_wrong_role_not_verified_in_status(self):
+        fake, service = self._seeded_fake_with_wrong_role()
+        items, overall = await service.get_rag_status()
+        by_scope = {i.scope: (i.status, i.member_status) for i in items}
+        # external_public 存在但成员 role 不符 → member missing
+        assert by_scope["external_public"] == ("exists", "missing")
+        assert by_scope["internal_shared"] == ("exists", "verified")
+        # 存在 Dataset 但成员不符 → overall 不是 ok
+        assert overall == "partial"
+        assert fake.upsert_calls == 0  # 状态查询零写
+
+    async def test_verify_only_detects_wrong_role_but_does_not_fix(self):
+        fake, service = self._seeded_fake_with_wrong_role()
+        items, overall, _result = await service.bootstrap_datasets(
+            verify_only=True, operator_user_id="op-1"
+        )
+        by_scope = {i.scope: (i.status, i.member_status) for i in items}
+        assert by_scope["external_public"] == ("existed", "missing")
+        assert overall == "partial"
+        assert fake.upsert_calls == 0  # verify-only 不允许修正
+
+    async def test_real_bootstrap_fixes_wrong_role(self):
+        fake, service = self._seeded_fake_with_wrong_role()
+        items, overall, _result = await service.bootstrap_datasets(
+            verify_only=False, operator_user_id="op-1"
+        )
+        assert {i.scope: i.member_status for i in items}["external_public"] == "ensured"
+        assert overall == "succeeded"
+        # 上游成员已修正为 viewer
+        assert (
+            fake.members[("securities_external_public", "svc_knowledge_employee")]["role"]
+            == "viewer"
+        )
+
+        # 再次校验 → verified
+        items2, overall2, _r2 = await service.bootstrap_datasets(
+            verify_only=True, operator_user_id="op-1"
+        )
+        assert {i.scope: i.member_status for i in items2}["external_public"] == "verified"
+        assert overall2 == "succeeded"
+
+    async def test_member_missing_means_overall_not_ok(self):
+        fake = FakeRag()
+        for ds in (
+            "securities_external_public",
+            "securities_internal_shared",
+            "securities_admin_private",
+        ):
+            fake.seed_dataset(ds)
+        # 不种任何成员：internal_shared/external_public 成员缺失
+        service = _fake_service(fake)
+        _items, overall = await service.get_rag_status()
+        assert overall == "partial"
+
+
+class TestImportBaseUrlConfigured:
+    def test_configured_flag_follows_real_config(self, monkeypatch):
+        import app.services.bootstrap_service as mod
+
+        class FakeSettings:
+            rag_import_base_url = ""
+
+        monkeypatch.setattr(mod, "get_settings", lambda: FakeSettings())
+        assert mod.is_import_base_url_configured() is False
+
+        FakeSettings.rag_import_base_url = "http://127.0.0.1:8011"
+        assert mod.is_import_base_url_configured() is True
+
+        FakeSettings.rag_import_base_url = "   "
+        assert mod.is_import_base_url_configured() is False
+
+
+class TestDefaultSharedClient:
+    def test_bootstrap_service_defaults_to_shared_client(self, monkeypatch):
+        import app.services.bootstrap_service as mod
+        from app.rag import rag_import_client as ric
+
+        monkeypatch.setattr(ric, "_shared_client", None)
+        fake_client = object()
+
+        def fake_get() -> object:
+            return fake_client
+
+        monkeypatch.setattr(mod, "get_rag_import_client", fake_get)
+        service = BootstrapService()
+        assert service.client is fake_client  # 正常应用路径复用共享 client

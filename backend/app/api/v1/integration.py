@@ -15,7 +15,7 @@ from app.schemas.integration import (
     RagStatusResponse,
 )
 from app.services.audit_service import AuditService
-from app.services.bootstrap_service import BootstrapService
+from app.services.bootstrap_service import BootstrapService, is_import_base_url_configured
 
 router = APIRouter(prefix="/admin/integration", tags=["integration"])
 
@@ -35,7 +35,7 @@ async def rag_status(
     return RagStatusResponse(
         request_id=get_request_id(),
         data=RagStatusData(
-            import_base_url_configured=bool(items),
+            import_base_url_configured=is_import_base_url_configured(),
             datasets=items,
             overall=overall,
         ),

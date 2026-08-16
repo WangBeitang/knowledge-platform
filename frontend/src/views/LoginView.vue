@@ -18,6 +18,8 @@ const loading = ref(false)
 const errorMessage = ref('')
 
 async function handleSubmit(): Promise<void> {
+  // loading guard：提交中不重复提交（防连点/重复 Enter 产生多个 auth_sessions）
+  if (loading.value) return
   if (!form.username.trim() || !form.password) {
     errorMessage.value = '请输入用户名和密码'
     return
@@ -51,6 +53,7 @@ async function handleSubmit(): Promise<void> {
         </p>
       </div>
 
+      <!-- 只保留一条提交链：form submit + button native-type=submit -->
       <el-form
         label-position="top"
         @submit.prevent="handleSubmit"
@@ -61,7 +64,6 @@ async function handleSubmit(): Promise<void> {
             placeholder="请输入用户名"
             autocomplete="username"
             size="large"
-            @keyup.enter="handleSubmit"
           />
         </el-form-item>
         <el-form-item label="密码">
@@ -72,7 +74,6 @@ async function handleSubmit(): Promise<void> {
             autocomplete="current-password"
             show-password
             size="large"
-            @keyup.enter="handleSubmit"
           />
         </el-form-item>
 
@@ -91,7 +92,6 @@ async function handleSubmit(): Promise<void> {
           class="login-button"
           :loading="loading"
           native-type="submit"
-          @click="handleSubmit"
         >
           登 录
         </el-button>

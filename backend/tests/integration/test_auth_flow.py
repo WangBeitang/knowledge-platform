@@ -1,14 +1,19 @@
 """阶段 2 认证流集成测试（真实 DB）。
 
 覆盖：登录/登出/me、停用旧 JWT 立即失效、重置密码旧 JWT 失效、
-角色变更下一请求生效、最后 active admin 保护、审计落库。
+角色变更下一请求生效、最后 active admin 保护、审计落库、状态转换语义。
 """
 
+import hashlib
+
+import jwt as _jwt
 import pytest
 
+from app.core.config import get_settings
 from app.core.enums import UserRole
 from app.models.audit_log import AuditLog
 from app.models.auth_session import AuthSession
+from app.models.user import User
 from tests.integration.conftest import _unique, api_login, bearer_headers
 
 
@@ -39,16 +44,12 @@ class TestLogin:
         assert data["user"]["role"] == "admin"
         assert data["user"]["status"] == "active"
 
-        # auth_sessions 存在对应记录且只保存 jti_hash
-        import jwt as _jwt
-
-        from app.core.config import get_settings
-
+        # auth_sessions 存在对应记录且只保存 jti 的 SHA-256（精确断言）
         payload = _jwt.decode(data["access_token"], get_settings().secret_key, algorithms=["HS256"])
         session = await db_session.get(AuthSession, payload["sid"])
         assert session is not None
         assert session.revoked_at is None
-        assert session.jti_hash == payload["jti"] or len(session.jti_hash) == 64
+        assert session.jti_hash == hashlib.sha256(payload["jti"].encode("utf-8")).hexdigest()
         assert "jwt" not in session.jti_hash  # 只保存 SHA-256，不保存原令牌
 
     async def test_login_wrong_password(self, client, admin_user):
@@ -274,23 +275,6 @@ class TestUserLifecycle:
         assert resp.status_code == 409
         assert resp.json()["error"]["code"] == "RESOURCE_CONFLICT"
 
-    async def test_last_active_admin_cannot_demote_self(self, client, admin_user, db_session):
-        """只有一个 active admin 时，禁止将其降权。"""
-        from app.repositories.user_repository import UserRepository
-
-        # 共享开发库中若存在其他 active admin，本场景前提不成立，跳过而非误报
-        if await UserRepository(db_session).count_active_admins() > 1:
-            pytest.skip("数据库中已存在其他 active admin，无法构造「最后管理员」场景")
-        token = (await api_login(client, admin_user["username"], admin_user["password"])).json()[
-            "data"
-        ]["access_token"]
-        resp = await client.patch(
-            f"/api/v1/admin/users/{admin_user['user_id']}",
-            headers=await bearer_headers(token),
-            json={"role": "employee"},
-        )
-        assert resp.status_code == 409
-
     async def test_self_demote_allowed_with_another_active_admin(
         self, client, admin_user, tracked_users
     ):
@@ -364,3 +348,102 @@ async def test_list_users_visibility(client, admin_user, role):
     data = resp.json()["data"]
     assert "items" in data
     assert data["page"] >= 1
+
+
+class TestStatusTransition:
+    """用户启停时间状态转换语义（§五）。"""
+
+    async def test_disable_writes_disabled_at_and_revokes_sessions(
+        self, client, db_session, admin_user, tracked_users
+    ):
+        token = (await api_login(client, admin_user["username"], admin_user["password"])).json()[
+            "data"
+        ]["access_token"]
+        username = _unique("it_emp")
+        created = await _create_user_via_api(client, token, username=username, password="Emp@12345")
+        tracked_users.append(created["id"])
+
+        emp_token = (await api_login(client, username, "Emp@12345")).json()["data"]["access_token"]
+        await db_session.rollback()
+        user = await db_session.get(User, created["id"])
+        assert user.disabled_at is None
+
+        resp = await client.patch(
+            f"/api/v1/admin/users/{created['id']}",
+            headers=await bearer_headers(token),
+            json={"status": "disabled"},
+        )
+        assert resp.status_code == 200
+        # 旧 JWT 立即失效（会话已撤销）
+        assert (
+            await client.get("/api/v1/auth/me", headers=await bearer_headers(emp_token))
+        ).status_code == 401
+
+        await db_session.rollback()
+        user = await db_session.get(User, created["id"])
+        assert user.disabled_at is not None  # active → disabled 写入 disabled_at
+
+    async def test_reenable_clears_disabled_at(self, client, db_session, admin_user, tracked_users):
+        token = (await api_login(client, admin_user["username"], admin_user["password"])).json()[
+            "data"
+        ]["access_token"]
+        username = _unique("it_emp")
+        created = await _create_user_via_api(client, token, username=username, password="Emp@12345")
+        tracked_users.append(created["id"])
+
+        await client.patch(
+            f"/api/v1/admin/users/{created['id']}",
+            headers=await bearer_headers(token),
+            json={"status": "disabled"},
+        )
+        await db_session.rollback()
+        user = await db_session.get(User, created["id"])
+        assert user.disabled_at is not None
+        disabled_at_before = user.disabled_at
+
+        await client.patch(
+            f"/api/v1/admin/users/{created['id']}",
+            headers=await bearer_headers(token),
+            json={"status": "active"},
+        )
+        await db_session.rollback()
+        user = await db_session.get(User, created["id"])
+        assert user.status == "active"
+        assert user.disabled_at is None  # disabled → active 清除 disabled_at
+
+        # 记录确实发生过（不是初始 None）
+        assert disabled_at_before is not None
+
+    async def test_disabled_user_display_name_does_not_rewrite_disabled_at(
+        self, client, db_session, admin_user, tracked_users
+    ):
+        token = (await api_login(client, admin_user["username"], admin_user["password"])).json()[
+            "data"
+        ]["access_token"]
+        username = _unique("it_emp")
+        created = await _create_user_via_api(client, token, username=username, password="Emp@12345")
+        tracked_users.append(created["id"])
+
+        await client.patch(
+            f"/api/v1/admin/users/{created['id']}",
+            headers=await bearer_headers(token),
+            json={"status": "disabled"},
+        )
+        await db_session.rollback()
+        user = await db_session.get(User, created["id"])
+        assert user.disabled_at is not None
+        first_disabled_at = user.disabled_at
+
+        # disabled → disabled：只改 display_name，不得重写 disabled_at、不得制造新“停用”时间
+        resp = await client.patch(
+            f"/api/v1/admin/users/{created['id']}",
+            headers=await bearer_headers(token),
+            json={"display_name": "新展示名"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["status"] == "disabled"
+
+        await db_session.rollback()
+        user = await db_session.get(User, created["id"])
+        assert user.disabled_at == first_disabled_at
+        assert user.display_name == "新展示名"

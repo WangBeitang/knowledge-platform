@@ -7,14 +7,15 @@
 - `auth_sessions` 只保存 jti 的 SHA-256，禁止保存完整 JWT。
 
 精度约定（DATETIME(6) 与 JWT 秒级 iat）：
-- 签发时 `iat = floor(now)`；若与最近 `password_changed_at` 处于同一秒，
-  iat 提升到下一秒，保证“重置密码后立即重新登录”的新 Token 不会被误判为旧 Token；
-- 校验时按 `iat < ceil(password_changed_at)` 判定旧 Token（详见
-  `is_iat_before_password_change`）。
+- JWT `iat` 始终是**真实签发秒**（不制造未来时间），PyJWT 标准 `verify_iat` 保持开启；
+- 同秒边界由 `auth_sessions.issued_at`（DATETIME(6)，微秒精度）解决，规则见
+  `is_iat_before_password_change`：
+  1. `iat` 明显早于 `password_changed_at` 所在秒 → 旧 Token；
+  2. 明显晚于 → 新 Token；
+  3. 二者同秒 → 用微秒级 `session.issued_at < password_changed_at` 判定旧 Token。
 """
 
 import hashlib
-import math
 import time
 import uuid
 from datetime import datetime
@@ -68,23 +69,30 @@ def jti_hash(jti: str) -> str:
     return hashlib.sha256(jti.encode("utf-8")).hexdigest()
 
 
-def _ceil_seconds(dt: datetime) -> int:
-    """把（可能是微秒精度）时间向上取整到秒的时间戳。"""
-    aware = to_utc_aware(dt)
-    ts = aware.timestamp()
-    return math.ceil(ts)
+def is_iat_before_password_change(
+    iat: int,
+    session_issued_at: datetime,
+    password_changed_at: datetime,
+) -> bool:
+    """判断 JWT 是否应视为旧 Token（签发早于最近密码变更）。
 
+    DATETIME(6) 微秒精度 vs JWT 秒级 iat 的同秒边界处理：
+    1. `iat` 明显早于 `password_changed_at` 所在秒 → 旧 Token（True）；
+    2. 明显晚于 → 新 Token（False）；
+    3. 同秒 → 用会话微秒级签发时间 `session_issued_at` 与 `password_changed_at`
+       比较：会话签发早于密码变更 → 旧 Token（True）。
 
-def is_iat_before_password_change(iat: int, password_changed_at: datetime) -> bool:
-    """判断 JWT 签发时间是否早于最近密码变更时间。
-
-    返回 True 表示该 Token 应视为旧 Token（拒绝）。
-    DATETIME(6) 微秒精度 vs JWT 秒级 iat：统一用 `ceil(密码变更时间)` 比较，
-    配合签发侧同秒提升 iat 的逻辑（见 create_access_token），保证：
-    - 重置前的旧 Token 立即失效（含同秒场景）；
-    - 重置后立即登录的新 Token 不被误判。
+    这样保证：重置前同秒签发的旧 Token 失效、重置后同秒重新登录的新 Token 有效，
+    且不制造未来 iat、不关闭标准 iat 校验。
     """
-    return iat < _ceil_seconds(password_changed_at)
+    pca_aware = to_utc_aware(password_changed_at)
+    pca_sec = int(pca_aware.timestamp())  # 变更所在秒（floor）
+    if iat < pca_sec:
+        return True
+    if iat > pca_sec:
+        return False
+    # 同一秒：微秒级比较会话签发时间与密码变更时间
+    return to_utc_aware(session_issued_at) < pca_aware
 
 
 def create_access_token(
@@ -93,22 +101,15 @@ def create_access_token(
     session_id: str,
     jti: str,
     role: str,
-    password_changed_at: datetime | None = None,
     expires_seconds: int | None = None,
 ) -> tuple[str, int]:
     """签发 JWT，返回 (token, expires_in)。
 
-    password_changed_at 用于处理同秒边界：若签发秒与最近密码变更秒相同，
-    iat 取下一秒，避免“重置后同秒重新登录”的新 Token 被 `is_iat_before_password_change`
-    误判为旧 Token。
+    `iat` 为真实签发秒（floor(now)），不制造未来签发时间；
+    同秒边界由鉴权链用 `auth_sessions.issued_at` 微秒值解决。
     """
     settings = get_settings()
-    now = time.time()
-    iat = int(now)  # floor 到秒
-    if password_changed_at is not None:
-        changed_sec = int(to_utc_aware(password_changed_at).timestamp())
-        if iat == changed_sec:
-            iat += 1
+    iat = int(time.time())
     expires_in = expires_seconds or settings.jwt_expires_seconds
     payload: dict[str, Any] = {
         "sub": user_id,
@@ -123,17 +124,6 @@ def create_access_token(
 
 
 def decode_access_token(token: str) -> dict[str, Any]:
-    """解码并校验签名与过期；失败抛 jwt 异常由调用方映射为 AUTH_REQUIRED。
-
-    关闭 PyJWT 对 `iat` 的“不得晚于当前时间”校验：平台在签发时可能为处理
-    DATETIME(6) 与秒级 iat 的同秒边界，有意把 iat 提升到下一秒（见
-    `create_access_token`）；iat 与 `password_changed_at` 的语义比较由
-    `is_iat_before_password_change` 在鉴权链中自行完成。签名与 exp 校验保持开启。
-    """
+    """解码并校验签名、过期与标准 iat 校验；失败抛 jwt 异常由调用方映射为 AUTH_REQUIRED。"""
     settings = get_settings()
-    return jwt.decode(
-        token,
-        settings.secret_key,
-        algorithms=[ALGORITHM],
-        options={"verify_iat": False},
-    )
+    return jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])

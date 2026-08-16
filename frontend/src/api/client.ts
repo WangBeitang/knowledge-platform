@@ -24,10 +24,14 @@ export class ApiError extends Error {
   }
 }
 
-let onUnauthorized: (() => void) | null = null
+const unauthorizedHandlers = new Set<() => void>()
 
 export function setUnauthorizedHandler(handler: (() => void) | null): void {
-  onUnauthorized = handler
+  if (handler) {
+    unauthorizedHandlers.add(handler)
+  } else {
+    unauthorizedHandlers.clear()
+  }
 }
 
 export function getStoredToken(): string | null {
@@ -74,7 +78,8 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<A
     const requestId = (payload && 'request_id' in payload ? payload.request_id : '') as string
     if (resp.status === 401 && errorBody.code === 'AUTH_REQUIRED') {
       storeToken(null)
-      onUnauthorized?.()
+      // 触发全部 401 处理器（清登录态 + 跳转登录页）
+      unauthorizedHandlers.forEach((handler) => handler())
     }
     throw new ApiError(errorBody, requestId)
   }

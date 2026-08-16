@@ -28,6 +28,22 @@ class UserRepository(BaseRepository[User]):
         )
         return int(await self.session.scalar(stmt) or 0)
 
+    async def lock_active_admins(self) -> list[User]:
+        """SELECT ... FOR UPDATE 锁定当前全部 active admin 行（同一事务内使用）。
+
+        用于“最后 active admin”保护的并发窗口消除：锁定后重算数量，与后续
+        UPDATE 在同一事务内，避免 count → update 之间其他请求把数量降为 0。
+        """
+        stmt = (
+            select(User)
+            .where(
+                User.role == UserRole.admin.value,
+                User.status == UserStatus.active.value,
+            )
+            .with_for_update()
+        )
+        return list((await self.session.scalars(stmt)).all())
+
     async def is_active_admin(self, user_id: str) -> bool:
         stmt = select(User).where(
             User.id == user_id,

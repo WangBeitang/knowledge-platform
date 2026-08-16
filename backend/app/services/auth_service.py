@@ -97,7 +97,6 @@ class AuthService:
             session_id=session.id,
             jti=jti,
             role=user.role,
-            password_changed_at=user.password_changed_at,
             expires_seconds=settings.jwt_expires_seconds,
         )
         await self.users.touch_login(user, now)
@@ -130,6 +129,7 @@ class AuthService:
         user = await self.users.get_by_id(sub)
         if user is None or user.status != "active":
             raise TOKEN_INVALID
-        if is_iat_before_password_change(iat, user.password_changed_at):
+        # 同秒边界：JWT iat 秒级 + 会话签发时间微秒级，共同判定是否早于最近密码变更
+        if is_iat_before_password_change(iat, session.issued_at, user.password_changed_at):
             raise TOKEN_INVALID
         return user

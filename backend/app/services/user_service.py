@@ -4,7 +4,13 @@
 - username 全局唯一、统一转小写；role 仅 admin|employee；status 初始 active；
 - 系统始终至少存在一个 active admin；管理员不能停用自己；
 - 任何角色/状态修改不得把 active admin 数量降为 0（自己降权允许，只要仍有其他 active admin）；
+- 状态转换语义：active→disabled 写 disabled_at 并撤销会话；disabled→active 清 disabled_at；
+  disabled→disabled（如只改 display_name）不重写 disabled_at、不重复撤销会话；
 - 重置密码必须更新 password_changed_at 并撤销该用户全部会话（旧 JWT 立即失效）。
+
+最后 active admin 并发保护：当修改会把某 active admin 移出 active admin 集合时，
+在同一事务内 `SELECT ... FOR UPDATE` 锁定当前 active admin 行，锁定后重算数量，
+只有数量 > 1 才允许降权/停用。
 """
 
 from app.core.enums import AuditAction, UserRole, UserStatus
@@ -33,6 +39,33 @@ def user_view(user: User) -> UserView:
         created_at=iso8601(user.created_at),
         updated_at=iso8601(user.updated_at),
     )
+
+
+def validate_admin_transition(
+    *,
+    operator_id: str,
+    target: User,
+    next_role: str,
+    next_status: str,
+    active_admin_count: int,
+) -> None:
+    """最后 active admin 保护的确定性判定（纯函数，可单测）。
+
+    - 管理员不能停用自己（无论是否最后一个）；
+    - 若修改会把当前 active admin 移出 active admin 集合，且移除后数量为 0 → 409；
+    - 自己降权：有其他 active admin（count > 1）时允许。
+    """
+    if next_status == UserStatus.disabled.value and target.id == operator_id:
+        raise conflict("管理员不能停用自己")
+
+    is_active_admin_now = (
+        target.role == UserRole.admin.value and target.status == UserStatus.active.value
+    )
+    stays_active_admin = (
+        next_role == UserRole.admin.value and next_status == UserStatus.active.value
+    )
+    if is_active_admin_now and not stays_active_admin and active_admin_count <= 1:
+        raise conflict("系统至少需要保留一个有效管理员，无法完成该修改")
 
 
 class UserService:
@@ -125,19 +158,25 @@ class UserService:
         next_role = role or target.role
         next_status = status or target.status
 
-        await self._validate_last_active_admin(
+        # 最后 active admin 保护：同一事务内锁定 active admin 行后重算数量
+        await self._active_admin_count_under_lock(
             target, next_role=next_role, next_status=next_status, operator=operator
         )
+
         if display_name is not None:
             target.display_name = display_name.strip()
         target.role = next_role
+        old_status = target.status
         target.status = next_status
-        if next_status == UserStatus.disabled.value:
-            from app.core.time import utc_now_naive as _now
-
-            target.disabled_at = _now()
-            # 停用即撤销该用户全部会话：旧 JWT 下一次请求立即失效
-            await self.sessions.revoke_all_for_user(target.id, utc_now_naive())
+        # 状态转换语义：只有 status 实际变化时才维护 disabled_at / 撤销会话
+        if next_status != old_status:
+            if next_status == UserStatus.disabled.value:
+                target.disabled_at = utc_now_naive()
+                # 停用即撤销该用户全部会话：旧 JWT 下一次请求立即失效
+                await self.sessions.revoke_all_for_user(target.id, utc_now_naive())
+            elif old_status == UserStatus.disabled.value:
+                # disabled → active：清除停用时间
+                target.disabled_at = None
         target.updated_at = utc_now_naive()
         await self.users.session.flush()
 
@@ -156,31 +195,39 @@ class UserService:
         )
         return user_view(target)
 
-    async def _validate_last_active_admin(
+    async def _active_admin_count_under_lock(
         self,
         target: User,
         *,
         next_role: str,
         next_status: str,
         operator: User,
-    ) -> None:
-        """最后 active admin 保护 + 管理员不能停用自己。"""
-        if next_status == UserStatus.disabled.value and target.id == operator.id:
-            raise conflict("管理员不能停用自己")
+    ) -> int:
+        """计算 active admin 数量；若本次修改会把 target 移出集合，则先加行锁再重算。
 
+        - “管理员不能停用自己”不依赖数量，先做确定性校验（纯函数内）；
+        - 需要数量判定时，`SELECT ... FOR UPDATE` 锁定当前 active admin 行，
+          与后续 UPDATE 处于同一事务，杜绝 count→update 并发窗口。
+        """
         is_active_admin_now = (
             target.role == UserRole.admin.value and target.status == UserStatus.active.value
         )
         stays_active_admin = (
             next_role == UserRole.admin.value and next_status == UserStatus.active.value
         )
-        if not is_active_admin_now or stays_active_admin:
-            return
-        # 本次修改会把 target 移出 active admin：必须保证系统仍有其他 active admin
-        active_admin_count = await self.users.count_active_admins()
-        # count 包含 target 自身；<= 1 表示移除后为 0
-        if active_admin_count <= 1:
-            raise conflict("系统至少需要保留一个有效管理员，无法完成该修改")
+        if is_active_admin_now and not stays_active_admin:
+            admins = await self.users.lock_active_admins()
+            count = len(admins)
+        else:
+            count = await self.users.count_active_admins()
+        validate_admin_transition(
+            operator_id=operator.id,
+            target=target,
+            next_role=next_role,
+            next_status=next_status,
+            active_admin_count=count,
+        )
+        return count
 
     async def reset_password(
         self,
