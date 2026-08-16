@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# 环境与密钥（真实 .env 只存在于本地/目标环境，不进仓库）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Node / 前端
+node_modules/
+frontend/dist/
+.vite/
+coverage/
+.nyc_output/
+.eslintcache
+.npm/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# 日志
+*.log
+logs/
