@@ -186,6 +186,7 @@ class RagImportClient:
         dataset_id: str,
         visibility: str,
         service_user: str,
+        content_type: str = "application/pdf",
     ) -> dict:
         """POST /upload：单文件上传，创建原 RAG 导入任务。
 
@@ -193,8 +194,11 @@ class RagImportClient:
         dataset_id 必须与请求一致；index_version 必须为整数。
         不自动重试：断线时无法确定上游是否已接收，重试可能重复创建。
         返回 {rag_task_id, rag_document_id, index_version}。
+
+        原 RAG 只按文件名后缀（.pdf/.md）识别文件类型，不校验 Content-Type；
+        FAQ 文档同步复用本接口上传 Markdown（content_type 传 text/markdown）。
         """
-        files = {"files": (file_name, file_bytes, "application/pdf")}
+        files = {"files": (file_name, file_bytes, content_type)}
         data = {"dataset_id": dataset_id, "visibility": visibility}
         try:
             resp = await self._client.post(

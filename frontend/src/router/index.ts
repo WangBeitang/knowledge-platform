@@ -57,6 +57,24 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '文档详情', adminOnly: true },
       },
       {
+        path: 'admin/faq-candidates',
+        name: 'admin-faq-candidates',
+        component: () => import('@/views/admin/FaqCandidatesView.vue'),
+        meta: { title: 'FAQ 候选', adminOnly: true },
+      },
+      {
+        path: 'admin/faqs',
+        name: 'admin-faqs',
+        component: () => import('@/views/admin/FaqLibraryView.vue'),
+        meta: { title: 'FAQ 管理', adminOnly: true },
+      },
+      {
+        path: 'admin/faq-sync-runs',
+        name: 'admin-faq-sync-runs',
+        component: () => import('@/views/admin/FaqSyncRunsView.vue'),
+        meta: { title: 'FAQ 同步状态', adminOnly: true },
+      },
+      {
         path: 'home',
         name: 'home',
         component: () => import('@/views/employee/HomeView.vue'),

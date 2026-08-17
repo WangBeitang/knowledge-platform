@@ -271,3 +271,67 @@ export interface SseErrorData {
   message: string
   retryable: boolean
 }
+
+// ========== Stage 5：FAQ 闭环 ==========
+
+export type FaqCandidateStatus = 'pending_review' | 'published' | 'rejected'
+
+export type FaqStatus = 'published' | 'unpublished'
+
+export type FaqSyncStatus = 'pending' | 'syncing' | 'succeeded' | 'failed'
+
+export interface FaqCandidateView {
+  id: string
+  knowledge_scope: KnowledgeScope
+  normalized_question: string
+  normalized_question_hash: string
+  sample_questions: string[]
+  ask_count: number
+  suggested_answer: string | null
+  status: FaqCandidateStatus
+  published_faq_id: string | null
+  generated_at: string | null
+  reviewed_by_user_id: string | null
+  reviewed_at: string | null
+}
+
+export interface FaqView {
+  id: string
+  knowledge_scope: KnowledgeScope
+  question: string
+  normalized_question: string
+  normalized_question_hash: string
+  answer: string
+  status: FaqStatus
+  source_candidate_id: string | null
+  hit_count: number
+  rag_sync_status: FaqSyncStatus
+  rag_sync_error: string | null
+  created_by_user_id: string
+  reviewed_by_user_id: string
+  published_at: string | null
+  updated_at: string | null
+  unpublished_at: string | null
+}
+
+export interface FaqSyncRunView {
+  id: string
+  knowledge_scope: KnowledgeScope
+  content_hash: string
+  generated_file_name: string
+  status: FaqSyncStatus
+  rag_task_id: string | null
+  rag_document_id: string | null
+  previous_rag_document_id: string | null
+  error_code: string | null
+  error_message: string | null
+  requested_by_user_id: string
+  created_at: string | null
+  finished_at: string | null
+}
+
+export interface FaqAnalyzeData {
+  created: number
+  updated: number
+  skipped_published: number
+}

@@ -4,9 +4,11 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   ChatDotRound,
   Clock,
+  Collection,
   Connection,
   Document,
   HomeFilled,
+  QuestionFilled,
   UploadFilled,
   User,
 } from '@element-plus/icons-vue'
@@ -24,6 +26,9 @@ const adminMenu = [
   { path: '/admin/users', label: '员工账号', icon: User },
   { path: '/admin/knowledge-import', label: '知识导入', icon: UploadFilled },
   { path: '/admin/documents', label: '文档管理', icon: Document },
+  { path: '/admin/faq-candidates', label: 'FAQ 候选', icon: QuestionFilled },
+  { path: '/admin/faqs', label: 'FAQ 管理', icon: Collection },
+  { path: '/admin/faq-sync-runs', label: 'FAQ 同步', icon: Clock },
   { path: '/admin/integration', label: '系统集成', icon: Connection },
 ]
 

@@ -45,8 +45,9 @@ class FakeRag:
         self.rebuild_calls = 0
         self.enabled_calls = 0
         self._seq = 0
-        # 测试控制：模拟上游删除失败（409）/ 未知任务状态
+        # 测试控制：模拟上游删除失败（409）/ 未知任务状态 / 上传失败
         self.fail_delete = False
+        self.fail_upload = False
         self.unknown_task_status: str | None = None
 
     # ---------- 测试控制 ----------
@@ -183,6 +184,8 @@ class FakeRag:
 
     def _handle_upload(self, request: httpx.Request) -> httpx.Response:
         self.upload_calls += 1
+        if self.fail_upload:
+            return httpx.Response(503, json={"detail": "模拟上游不可用"})
         dataset_id = (
             _extract_form_field(request.content, "dataset_id") or "securities_internal_shared"
         )

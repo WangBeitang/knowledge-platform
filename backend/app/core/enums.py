@@ -124,6 +124,15 @@ class AuditAction(StrEnum):
     document_replace = "document_replace"
     document_delete = "document_delete"
     chunk_status_changed = "chunk_status_changed"
+    # Stage 5：FAQ 闭环
+    faq_candidate_published = "faq_candidate_published"
+    faq_candidate_rejected = "faq_candidate_rejected"
+    faq_created = "faq_created"
+    faq_updated = "faq_updated"
+    faq_published = "faq_published"
+    faq_unpublished = "faq_unpublished"
+    faq_republished = "faq_republished"
+    faq_sync_retried = "faq_sync_retried"
 
 
 class AuditResult(StrEnum):

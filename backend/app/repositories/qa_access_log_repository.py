@@ -2,10 +2,14 @@
 
 from datetime import datetime
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.models.qa_access_log import QaAccessLog
 from app.repositories.base import BaseRepository
+
+# FAQ 候选聚合的数量上限（冻结数据对象 §4.9：样例/来源日志"限制数量"）
+SAMPLE_QUESTIONS_LIMIT = 5
+SOURCE_LOG_IDS_LIMIT = 50
 
 
 class QaAccessLogRepository(BaseRepository[QaAccessLog]):
@@ -81,3 +85,53 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
                 total_tokens=total_tokens,
             )
         )
+
+    async def aggregate_by_hash(self) -> list[dict]:
+        """按 (knowledge_scope, normalized_question_hash) 聚合日志（FaqAnalysisService 使用）。
+
+        第一版只按归一化精确值聚合（冻结数据对象 §4.9：不声称语义聚类）：
+        - knowledge_scope 取每条日志 allowed_scopes_json 的第一优先级范围
+          （scopes_for_role 的顺序即优先级，平台集中计算，不在 SQL 中拼装）；
+        - ask_count = 组内日志条数；
+        - sample_questions 取组内去重后的原始问题（最多 SAMPLE_QUESTIONS_LIMIT 条）；
+        - source_log_ids 取组内日志 id（最多 SOURCE_LOG_IDS_LIMIT 条）。
+        """
+        from app.rag.scope_policy import VALID_SCOPES
+
+        rows = (await self.session.execute(select(QaAccessLog))).scalars().all()
+        groups: dict[tuple[str, str], dict] = {}
+        for log in rows:
+            scopes = [
+                s
+                for s in (log.allowed_scopes_json or [])
+                if isinstance(s, str) and s in VALID_SCOPES
+            ]
+            if not scopes:
+                continue
+            scope = scopes[0]  # 优先级最高（admin_private > internal_shared > external_public）
+            key = (scope, log.normalized_question_hash)
+            group = groups.setdefault(
+                key,
+                {
+                    "knowledge_scope": scope,
+                    "normalized_question": log.normalized_question,
+                    "normalized_question_hash": log.normalized_question_hash,
+                    "ask_count": 0,
+                    "sample_questions": [],
+                    "source_log_ids": [],
+                },
+            )
+            group["ask_count"] += 1
+            if log.question and log.question not in group["sample_questions"]:
+                group["sample_questions"].append(log.question[:500])
+            if log.id and len(group["source_log_ids"]) < SOURCE_LOG_IDS_LIMIT:
+                group["source_log_ids"].append(log.id)
+            # 样例问题与来源日志数量上限
+            if len(group["sample_questions"]) > SAMPLE_QUESTIONS_LIMIT:
+                group["sample_questions"] = group["sample_questions"][:SAMPLE_QUESTIONS_LIMIT]
+        # 排序稳定：ask_count 降序，hash 升序
+        items = sorted(
+            groups.values(),
+            key=lambda g: (-g["ask_count"], g["normalized_question_hash"]),
+        )
+        return items
