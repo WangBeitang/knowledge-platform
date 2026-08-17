@@ -56,7 +56,8 @@ class RagImportClient:
             transport=transport,
             timeout=httpx.Timeout(timeout=timeout, connect=5.0),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            headers={"Content-Type": "application/json"},
+            # 不设置全局 Content-Type：json= 与 files= 分别由 httpx 自动生成
+            # application/json / multipart boundary（显式全局头会破坏 multipart 上传）。
         )
 
     async def aclose(self) -> None:
