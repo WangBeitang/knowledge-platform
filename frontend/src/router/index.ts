@@ -62,6 +62,18 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/employee/HomeView.vue'),
         meta: { title: '工作台' },
       },
+      {
+        path: 'chat',
+        name: 'chat',
+        component: () => import('@/views/employee/ChatView.vue'),
+        meta: { title: '内部问答' },
+      },
+      {
+        path: 'chat/history',
+        name: 'chat-history',
+        component: () => import('@/views/employee/SessionHistoryView.vue'),
+        meta: { title: '历史记录' },
+      },
     ],
   },
   {

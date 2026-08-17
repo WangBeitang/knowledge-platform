@@ -86,14 +86,23 @@ async def create_user_record(
 
 
 async def cleanup_user(session, user_id: str) -> None:
-    """尽力清理测试用户相关记录（Stage 3 文档映射 → 审计 → 会话 → 用户）。"""
+    """尽力清理测试用户相关记录（聊天 → 文档映射 → 审计 → 会话 → 用户）。"""
     from sqlalchemy import delete, select
 
     from app.models.audit_log import AuditLog
     from app.models.auth_session import AuthSession
+    from app.models.chat_message import ChatMessage
+    from app.models.chat_session import ChatSession
     from app.models.document_replacement import DocumentReplacement
     from app.models.managed_document import ManagedDocument
+    from app.models.qa_access_log import QaAccessLog
     from app.models.rag_integration_task import RagIntegrationTask
+
+    # 聊天数据（FK：messages/logs → sessions → users）
+    session_ids = select(ChatSession.id).where(ChatSession.user_id == user_id)
+    await session.execute(delete(ChatMessage).where(ChatMessage.session_id.in_(session_ids)))
+    await session.execute(delete(QaAccessLog).where(QaAccessLog.session_id.in_(session_ids)))
+    await session.execute(delete(ChatSession).where(ChatSession.user_id == user_id))
 
     # 先清理该用户创建的文档映射及其关联（FK 顺序：replacements → tasks → documents）
     doc_ids = select(ManagedDocument.id).where(ManagedDocument.created_by_user_id == user_id)
@@ -156,3 +165,93 @@ async def api_login(client: httpx.AsyncClient, username: str, password: str) -> 
 
 async def bearer_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+# ---------- Stage 4 聊天测试夹具 ----------
+
+
+async def create_faq_record(
+    session,
+    *,
+    knowledge_scope: str,
+    question: str,
+    normalized_question: str,
+    normalized_question_hash: str,
+    answer: str,
+    created_by_user_id: str,
+):
+    """直接插入 published FAQ（测试夹具；Stage 5 才有发布接口）。"""
+    from app.core.enums import FaqStatus, RagSyncStatus
+    from app.models.faq import Faq
+
+    now = utc_now_naive()
+    faq = Faq(
+        knowledge_scope=knowledge_scope,
+        question=question,
+        normalized_question=normalized_question,
+        normalized_question_hash=normalized_question_hash,
+        answer=answer,
+        status=FaqStatus.published.value,
+        source_candidate_id=None,
+        hit_count=0,
+        rag_sync_status=RagSyncStatus.pending.value,
+        rag_sync_error=None,
+        created_by_user_id=created_by_user_id,
+        reviewed_by_user_id=created_by_user_id,
+        published_at=now,
+        updated_at=now,
+        unpublished_at=None,
+    )
+    session.add(faq)
+    await session.flush()
+    return faq
+
+
+async def cleanup_faqs(session, faq_ids: list[str]) -> None:
+    from sqlalchemy import delete
+
+    from app.models.faq import Faq
+
+    if faq_ids:
+        await session.execute(delete(Faq).where(Faq.id.in_(faq_ids)))
+        await session.commit()
+
+
+@pytest.fixture
+async def chat_rag_factory(monkeypatch):
+    """注入进程内 FakeQueryRag 到 chat 路由（Stage 4 集成测试）。"""
+    import httpx
+
+    import app.api.v1.chat as chat_mod
+    from app.rag.rag_query_client import RagQueryClient
+    from app.rag.rag_trace_client import RagTraceClient
+    from app.repositories.audit_log_repository import AuditLogRepository
+    from app.repositories.chat_message_repository import ChatMessageRepository
+    from app.repositories.chat_session_repository import ChatSessionRepository
+    from app.repositories.faq_repository import FaqRepository
+    from app.repositories.qa_access_log_repository import QaAccessLogRepository
+    from app.services.audit_service import AuditService
+    from app.services.chat_service import ChatService
+    from tests.integration.fake_query_rag_server import FakeQueryRag
+
+    fakes: list[FakeQueryRag] = []
+
+    def install(fake: FakeQueryRag, session) -> FakeQueryRag:
+        fakes.append(fake)
+        service = ChatService(
+            sessions=ChatSessionRepository(session),
+            messages=ChatMessageRepository(session),
+            logs=QaAccessLogRepository(session),
+            faq_repository=FaqRepository(session),
+            audit=AuditService(AuditLogRepository(session)),
+            query_client=RagQueryClient(
+                base_url="http://rag", transport=httpx.MockTransport(fake.handler)
+            ),
+            trace_client=RagTraceClient(
+                base_url="http://rag", transport=httpx.MockTransport(fake.handler)
+            ),
+        )
+        monkeypatch.setattr(chat_mod, "_chat_service", lambda s: service)
+        return fake
+
+    return install

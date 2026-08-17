@@ -1,7 +1,15 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Connection, Document, HomeFilled, UploadFilled, User } from '@element-plus/icons-vue'
+import {
+  ChatDotRound,
+  Clock,
+  Connection,
+  Document,
+  HomeFilled,
+  UploadFilled,
+  User,
+} from '@element-plus/icons-vue'
 
 import { useAuthStore } from '@/stores/auth'
 
@@ -17,6 +25,11 @@ const adminMenu = [
   { path: '/admin/knowledge-import', label: '知识导入', icon: UploadFilled },
   { path: '/admin/documents', label: '文档管理', icon: Document },
   { path: '/admin/integration', label: '系统集成', icon: Connection },
+]
+
+const commonMenu = [
+  { path: '/chat', label: '内部问答', icon: ChatDotRound },
+  { path: '/chat/history', label: '历史记录', icon: Clock },
 ]
 
 async function handleLogout(): Promise<void> {
@@ -63,6 +76,14 @@ async function handleLogout(): Promise<void> {
         <el-menu-item index="/home">
           <el-icon><HomeFilled /></el-icon>
           <span>工作台</span>
+        </el-menu-item>
+        <el-menu-item
+          v-for="item in commonMenu"
+          :key="item.path"
+          :index="item.path"
+        >
+          <el-icon><component :is="item.icon" /></el-icon>
+          <span>{{ item.label }}</span>
         </el-menu-item>
       </el-menu>
     </el-aside>

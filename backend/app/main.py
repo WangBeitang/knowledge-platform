@@ -34,9 +34,13 @@ async def lifespan(app: FastAPI):
     await close_redis()
     from app.rag.rag_document_client import close_rag_document_client
     from app.rag.rag_import_client import close_rag_import_client
+    from app.rag.rag_query_client import close_rag_query_client
+    from app.rag.rag_trace_client import close_rag_trace_client
 
     await close_rag_import_client()
     await close_rag_document_client()
+    await close_rag_query_client()
+    await close_rag_trace_client()
 
 
 def create_app() -> FastAPI:

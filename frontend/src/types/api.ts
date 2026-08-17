@@ -188,3 +188,86 @@ export interface ChunkSetEnabledData {
   index_version: number
   enabled: boolean
 }
+
+// ---- Stage 4 内部问答 ----
+
+export interface CitationView {
+  document_id: string | null
+  chunk_id: string | null
+  document_name: string | null
+  content_preview: string | null
+  score: number | null
+  source_url: string | null
+  index_version: number | null
+  raw: Record<string, unknown>
+}
+
+export interface ChatSessionView {
+  id: string
+  channel: string
+  user_id: string | null
+  title: string
+  status: 'active' | 'archived' | 'deleted'
+  last_message_at: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface ChatMessageView {
+  id: string
+  session_id: string
+  turn_id: string
+  seq_no: number
+  role: 'user' | 'assistant'
+  content: string
+  status: 'pending' | 'streaming' | 'completed' | 'failed'
+  answer_source: 'faq_cache' | 'rag' | 'none' | null
+  rag_trace_id: string | null
+  terminal_reason_code: string | null
+  citations: CitationView[]
+  error_code: string | null
+  created_at: string | null
+  completed_at: string | null
+}
+
+export interface ChatSessionDetailData {
+  session: ChatSessionView
+  messages: ChatMessageView[]
+}
+
+export interface SseProgressData {
+  request_id: string
+  turn_id: string
+  stage: 'faq_lookup' | 'rag_submit' | 'rag_progress' | 'finalizing'
+  message: string
+}
+
+export interface SseDeltaData {
+  request_id: string
+  turn_id: string
+  text: string
+}
+
+export interface SseReadyData {
+  request_id: string
+  turn_id: string
+  session_id: string
+}
+
+export interface SseFinalData {
+  request_id: string
+  turn_id: string
+  answer: string
+  answer_source: 'faq_cache' | 'rag'
+  trace_id: string | null
+  citations: CitationView[]
+  terminal_reason_code: string | null
+}
+
+export interface SseErrorData {
+  request_id: string
+  turn_id: string
+  code: string
+  message: string
+  retryable: boolean
+}
