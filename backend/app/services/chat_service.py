@@ -514,7 +514,13 @@ class ChatService:
         ):
             await _active_turns.release(session_id, turn_id)
 
-    async def recover_orphaned(self, session_id: str, user_id: str) -> None:
+    async def recover_orphaned(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        external_subject_hash: str | None = None,
+    ) -> None:
         """上一轮断开/歧义但未确认上游 terminal：先查上游 /status 判定。
 
         - 无记录 / release-safe / pre_submit（从未触达上游）→ 安全释放，允许新 Query；
@@ -524,6 +530,9 @@ class ChatService:
           completed 但字段不完整：已落库则释放，否则保守 409（不静默释放）；
         - /status=failed → 补齐失败态后释放；
         - /status 网络错误/无法确认 → 保守 409，不提交新 /query。
+
+        外部 API 调用时 user_id=None、external_subject_hash=加盐哈希：
+        TurnRecord.user_id 为空 → recover 持久化走 external_api 渠道语义。
 
         并发安全：begin_recover 抢占唯一 owner；被抢占者直接 409；
         所有关键更新（finish_recover/release）校验 turn_id。
@@ -557,7 +566,7 @@ class ChatService:
                 # /status=404：上游确认无该 session 任务 → 旧 Query 已不在运行；
                 # 未落库时补齐失败态（本轮问答未能完成），随后释放允许下一问
                 if not record.persisted:
-                    await self._recover_failed(record)
+                    await self._recover_failed(record, external_subject_hash=external_subject_hash)
                 await _active_turns.finish_recover(session_id, record.turn_id, release=True)
                 return
             if status.status in ("pending", "processing"):
@@ -566,7 +575,9 @@ class ChatService:
             if status.status == "completed":
                 if status.trace_id and status.answer:
                     if not record.persisted:
-                        await self._recover_terminal(record, status)
+                        await self._recover_terminal(
+                            record, status, external_subject_hash=external_subject_hash
+                        )
                     await _active_turns.finish_recover(session_id, record.turn_id, release=True)
                 elif record.persisted:
                     # 已落库（live error 已交付）→ 无需补齐，释放
@@ -578,7 +589,7 @@ class ChatService:
                 return
             if status.status == "failed":
                 if not record.persisted:
-                    await self._recover_failed(record)
+                    await self._recover_failed(record, external_subject_hash=external_subject_hash)
                 await _active_turns.finish_recover(session_id, record.turn_id, release=True)
                 return
             # 未知状态已由 Adapter 契约校验拒绝（RAG_BAD_RESPONSE），走 except
@@ -590,9 +601,15 @@ class ChatService:
             await _active_turns.finish_recover(session_id, record.turn_id, release=False)
             raise
 
-    async def _recover_terminal(self, record: TurnRecord, status) -> None:
-        """尽力补齐断开 Turn 的终态持久化（上游已 completed 且完整）。"""
-        chat_session = await self.sessions.get_owned(record.session_id, record.user_id)
+    async def _recover_terminal(
+        self, record: TurnRecord, status, *, external_subject_hash: str | None = None
+    ) -> None:
+        """尽力补齐断开 Turn 的终态持久化（上游已 completed 且完整）。
+
+        record 由归属校验通过的 Turn 创建（内部 get_owned / 外部 external 会话映射），
+        因此 recover 时按 id 定位会话即可，不重复校验归属。
+        """
+        chat_session = await self.sessions.get_by_id(record.session_id)
         if chat_session is None:
             return
         outcome = TurnOutcome(
@@ -613,12 +630,16 @@ class ChatService:
             turn_id=record.turn_id,
             outcome=outcome,
             started_at=record.started_at,
+            channel=("external_api" if record.user_id is None else "internal_web"),
+            external_subject_hash=external_subject_hash,
         )
         logger.info("断开 Turn 终态补齐 turn_id=%s", record.turn_id)
 
-    async def _recover_failed(self, record: TurnRecord) -> None:
+    async def _recover_failed(
+        self, record: TurnRecord, *, external_subject_hash: str | None = None
+    ) -> None:
         """尽力补齐断开 Turn 的失败态（上游 status=failed，非客户端断开导致）。"""
-        chat_session = await self.sessions.get_owned(record.session_id, record.user_id)
+        chat_session = await self.sessions.get_by_id(record.session_id)
         if chat_session is None:
             return
         outcome = TurnOutcome(success=False, error_code=ERR_RAG_BAD_RESPONSE)
@@ -632,8 +653,155 @@ class ChatService:
             turn_id=record.turn_id,
             outcome=outcome,
             started_at=record.started_at,
+            channel=("external_api" if record.user_id is None else "internal_web"),
+            external_subject_hash=external_subject_hash,
         )
         logger.info("断开 Turn 失败态补齐 turn_id=%s", record.turn_id)
+
+    async def get_or_create_external_session(
+        self, *, external_session_id: str, external_subject_hash: str
+    ) -> ChatSession:
+        """外部会话轻量映射（数据对象 §4.6）：按外部会话 ID + 用户哈希定位平台会话。
+
+        - 平台会话 ID（UUID）即上游 RAG session_id，与内部员工会话天然隔离；
+        - 同一个外部会话的多轮问题复用同一平台会话（保持上游多轮上下文）；
+        - 并发首问极小概率创建两个会话：后续请求总会命中最近创建的一个。
+        """
+        chat_session = await self.sessions.find_external_session(
+            external_session_id, external_subject_hash
+        )
+        if chat_session is not None:
+            return chat_session
+        chat_session = await self.sessions.create_external_session(
+            external_session_id=external_session_id,
+            external_subject_hash=external_subject_hash,
+            title=DEFAULT_SESSION_TITLE,
+            status=SessionStatus.active.value,
+            created_at=utc_now_naive(),
+        )
+        await self.sessions.session.commit()
+        return chat_session
+
+    def build_external_turn_record(
+        self,
+        *,
+        session_id: str,
+        question: str,
+        normalized: str,
+        question_hash_value: str,
+        scopes: list[str],
+        started_at: float,
+    ) -> TurnRecord:
+        """构造外部问答的 registry 记录：user_id 恒为空（匿名，不绑定员工账号）。"""
+        return TurnRecord(
+            session_id=session_id,
+            user_id=None,
+            turn_id=str(uuid.uuid4()),
+            question=question,
+            normalized=normalized,
+            question_hash=question_hash_value,
+            scopes=scopes,
+            started_at=started_at,
+        )
+
+    async def stream_external(
+        self,
+        *,
+        external_session_id: str,
+        external_subject_hash: str,
+        chat_session: ChatSession,
+        question: str,
+        normalized: str,
+        request_id: str,
+        background_tasks: BackgroundTasks,
+        started_at: float,
+        record: TurnRecord,
+    ) -> AsyncIterator[str]:
+        """外部知识 API 流式问答（《API 接口设计》§10 / §11，与内部共用 SSE 契约）。
+
+        外部权限服务端固定（禁止客户端输入扩大）：
+        - channel = external_api；
+        - allowed_scopes = [external_public]（scope_policy "external" 角色矩阵）；
+        - rag_dataset_ids = [RAG_EXTERNAL_DATASET_ID]；
+        - rag_service_user = RAG_SERVICE_USER_EXTERNAL；
+        - user_id = None；external_user_id 仅以加盐哈希关联日志/UV，不参与权限计算。
+
+        FAQ 精确命中：只允许 external_public，answer_source=faq_cache、
+        trace_id=null、citations=[]，不调用 RAG、不伪造 Citation；
+        未命中：走 `_rag_flow`（内部问答同一条编排，不复制第二套 RAG 流程）。
+        """
+        turn_id = record.turn_id
+        session_id = chat_session.id
+        question_hash_value = record.question_hash
+        scopes = record.scopes
+
+        # ready
+        yield _sse(
+            EV_READY,
+            {"request_id": request_id, "turn_id": turn_id, "session_id": session_id},
+        )
+        # progress(faq_lookup)
+        yield _progress(request_id, turn_id, STAGE_FAQ_LOOKUP, "正在检索常见问题")
+
+        # FAQ 精确短路（只允许 external_public）
+        faq_hit = await self.faq_service.lookup_exact_faq(
+            scopes=scopes,
+            normalized_question=normalized,
+            normalized_question_hash=question_hash_value,
+        )
+        if faq_hit is not None:
+            outcome = TurnOutcome(
+                success=True,
+                answer=faq_hit.answer,
+                answer_source=AnswerSource.faq_cache.value,
+                faq_id=faq_hit.faq_id,
+                citations=[],
+            )
+            await self._persist_turn(
+                chat_session=chat_session,
+                user_id=None,
+                question=question,
+                normalized=normalized,
+                question_hash=question_hash_value,
+                scopes=scopes,
+                turn_id=turn_id,
+                outcome=outcome,
+                started_at=started_at,
+                channel="external_api",
+                external_subject_hash=external_subject_hash,
+            )
+            # FAQ 命中禁止调用原 RAG；交付成功后显式记录命中
+            try:
+                await self.faq_service.record_hit(faq_hit.faq_id)
+            except Exception:  # noqa: BLE001 命中计数失败不影响已交付答案
+                logger.warning("FAQ hit_count 自增失败 faq_id=%s", faq_hit.faq_id)
+            await _active_turns.mark_persisted(session_id, turn_id)
+            # FAQ 从未触达上游 → release-safe
+            await _active_turns.mark_release_safe(session_id, turn_id)
+            yield _final_sse(request_id, turn_id, outcome)
+            return
+
+        # FAQ 未命中 → 原 RAG：固定 external 范围/Dataset/服务身份
+        rag_service_user = service_user_for_role("external")
+        dataset_ids = dataset_ids_for_role("external")
+        async for chunk in self._rag_flow(
+            request_id=request_id,
+            turn_id=turn_id,
+            session_id=session_id,
+            chat_session=chat_session,
+            user_id=None,
+            question=question,
+            normalized=normalized,
+            question_hash=question_hash_value,
+            scopes=scopes,
+            rag_service_user=rag_service_user,
+            dataset_ids=dataset_ids,
+            started_at=started_at,
+            background_tasks=background_tasks,
+            channel="external_api",
+            external_subject_hash=external_subject_hash,
+        ):
+            yield chunk
 
     async def stream_answer(
         self,
@@ -703,9 +871,57 @@ class ChatService:
             yield _final_sse(request_id, turn_id, outcome)
             return
 
-        # FAQ 未命中 → 原 RAG
+        # FAQ 未命中 → 原 RAG：固定按当前 DB 角色计算范围/Dataset/服务身份
         rag_service_user = service_user_for_role(user.role)
         dataset_ids = dataset_ids_for_role(user.role)
+        async for chunk in self._rag_flow(
+            request_id=request_id,
+            turn_id=turn_id,
+            session_id=session_id,
+            chat_session=chat_session,
+            user_id=user.id,
+            question=question,
+            normalized=normalized,
+            question_hash=question_hash_value,
+            scopes=scopes,
+            rag_service_user=rag_service_user,
+            dataset_ids=dataset_ids,
+            started_at=started_at,
+            background_tasks=background_tasks,
+            channel="internal_web",
+            external_subject_hash=None,
+        ):
+            yield chunk
+
+    async def _rag_flow(
+        self,
+        *,
+        request_id: str,
+        turn_id: str,
+        session_id: str,
+        chat_session: ChatSession,
+        user_id: str,
+        question: str,
+        normalized: str,
+        question_hash: str,
+        scopes: list[str],
+        rag_service_user: str,
+        dataset_ids: list[str],
+        started_at: float,
+        background_tasks: BackgroundTasks,
+        channel: str,
+        external_subject_hash: str | None,
+    ) -> AsyncIterator[str]:
+        """RAG 路径的统一编排（内部问答与外部 API 共用，禁止复制第二套）。
+
+        - submit → 流式 → 断流 /status 兜底 → 终态唯一交付；
+        - 上游身份与 Dataset 由调用方按冻结矩阵传入（内部按 DB 角色，
+          外部固定 RAG_SERVICE_USER_EXTERNAL + RAG_EXTERNAL_DATASET_ID）；
+        - 持久化差异（channel / external_subject_hash）由调用方传入，
+          内部 channel=internal_web、外部 channel=external_api；
+        - release-safe 判定与 Stage 4 冻结语义完全一致（可靠上游终态
+          / /status terminal / 404 / 从未触达上游才允许释放）。
+        """
         yield _progress(request_id, turn_id, STAGE_RAG_SUBMIT, "正在提交知识检索")
         # POST 开始前进入 submitting 并提前保存 service 身份：若提交发生网络
         # timeout/connection，上游是否已接受存在不确定性（acceptance-ambiguous），
@@ -724,14 +940,16 @@ class ChatService:
             outcome = TurnOutcome(success=False, error_code=_safe_rag_error_code(exc))
             await self._persist_turn(
                 chat_session=chat_session,
-                user_id=user.id,
+                user_id=user_id,
                 question=question,
                 normalized=normalized,
-                question_hash=question_hash_value,
+                question_hash=question_hash,
                 scopes=scopes,
                 turn_id=turn_id,
                 outcome=outcome,
                 started_at=started_at,
+                channel=channel,
+                external_subject_hash=external_subject_hash,
             )
             await _active_turns.mark_persisted(session_id, turn_id)
             if getattr(exc, "acceptance_ambiguous", False):
@@ -855,14 +1073,16 @@ class ChatService:
         )
         await self._persist_turn(
             chat_session=chat_session,
-            user_id=user.id,
+            user_id=user_id,
             question=question,
             normalized=normalized,
-            question_hash=question_hash_value,
+            question_hash=question_hash,
             scopes=scopes,
             turn_id=turn_id,
             outcome=outcome,
             started_at=started_at,
+            channel=channel,
+            external_subject_hash=external_subject_hash,
         )
         await _active_turns.mark_persisted(session_id, turn_id)
         if upstream_release_safe:
@@ -933,10 +1153,15 @@ class ChatService:
         turn_id: str,
         outcome: TurnOutcome,
         started_at: float,
+        channel: str = "internal_web",
+        external_subject_hash: str | None = None,
     ) -> None:
         """终态一次性落库：user + assistant 共用 turn_id，seq_no 严格递增。
 
         锁 session 行后分配 seq_no（配合 UNIQUE(session_id, seq_no) 防持久化竞争）。
+        内部问答（默认）channel=internal_web、user_id 为员工；外部 API 由
+        `stream_external` 传入 channel=external_api、user_id=None、
+        external_subject_hash=加盐哈希（冻结 API §10 / 数据对象 §4.8）。
         """
         session = self.sessions.session
         now = utc_now_naive()
@@ -991,9 +1216,9 @@ class ChatService:
         await self.logs.create_log(
             turn_id=turn_id,
             session_id=chat_session.id,
-            channel="internal_web",
+            channel=channel,
             user_id=user_id,
-            external_subject_hash=None,
+            external_subject_hash=external_subject_hash,
             question=question,
             normalized_question=normalized,
             normalized_question_hash=question_hash,

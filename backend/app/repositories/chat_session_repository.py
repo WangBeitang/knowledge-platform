@@ -47,6 +47,59 @@ class ChatSessionRepository(BaseRepository[ChatSession]):
         )
         return await self.session.scalar(stmt)
 
+    async def get_by_id(self, session_id: str) -> ChatSession | None:
+        """按 id 查询（不限定归属；外部 API 会话 user_id 为空，用本方法定位）。"""
+        return await self.session.get(ChatSession, session_id)
+
+    # ---------- 外部 API 轻量会话映射（数据对象 §4.6） ----------
+
+    async def find_external_session(
+        self, external_session_id: str, external_subject_hash: str
+    ) -> ChatSession | None:
+        """按外部会话映射定位平台会话（非 deleted，取最近创建的一条）。
+
+        `external_session_id` 只用于外部会话映射；平台会话 ID（UUID）作为上游
+        RAG session_id，天然与内部员工会话隔离。
+        """
+        stmt = (
+            select(ChatSession)
+            .where(
+                ChatSession.channel == "external_api",
+                ChatSession.external_session_id == external_session_id,
+                ChatSession.external_subject_hash == external_subject_hash,
+                ChatSession.status != "deleted",
+            )
+            .order_by(ChatSession.created_at.desc())
+            .limit(1)
+        )
+        return await self.session.scalar(stmt)
+
+    async def create_external_session(
+        self,
+        *,
+        external_session_id: str,
+        external_subject_hash: str,
+        title: str,
+        status: str,
+        created_at: datetime,
+    ) -> ChatSession:
+        """创建外部 API 会话：channel=external_api，user_id 恒为空，不绑定员工账号。"""
+        session = ChatSession(
+            channel="external_api",
+            user_id=None,
+            external_subject_hash=external_subject_hash,
+            external_session_id=external_session_id,
+            title=title,
+            status=status,
+            last_message_at=None,
+            deleted_at=None,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        self.session.add(session)
+        await self.session.flush()
+        return session
+
     async def list_by_user(
         self,
         *,

@@ -96,19 +96,13 @@ async def dashboard_cleanup(db_session):
     turn_ids: list[str] = []
     yield session_ids, turn_ids
     if turn_ids:
-        await db_session.execute(
-            delete(QaAccessLog).where(QaAccessLog.turn_id.in_(turn_ids))
-        )
+        await db_session.execute(delete(QaAccessLog).where(QaAccessLog.turn_id.in_(turn_ids)))
     if session_ids:
-        await db_session.execute(
-            delete(ChatSession).where(ChatSession.id.in_(session_ids))
-        )
+        await db_session.execute(delete(ChatSession).where(ChatSession.id.in_(session_ids)))
     await db_session.commit()
 
 
-async def test_summary_counts_real_logs(
-    client, db_session, admin_user, dashboard_cleanup
-):
+async def test_summary_counts_real_logs(client, db_session, admin_user, dashboard_cleanup):
     """summary 只统计真实日志：PV/UV/问答量/成功率/延迟/Token 全部正确。"""
     token = await _admin_token(client, admin_user)
     session_ids, turn_ids = await _seed_logs(
@@ -174,9 +168,7 @@ async def test_summary_counts_real_logs(
     assert data["token_coverage_rate"] == 0.5
 
 
-async def test_summary_date_and_channel_filter(
-    client, db_session, admin_user, dashboard_cleanup
-):
+async def test_summary_date_and_channel_filter(client, db_session, admin_user, dashboard_cleanup):
     """date_from/date_to/channel 过滤只统计区间内真实日志。"""
     token = await _admin_token(client, admin_user)
     session_ids, turn_ids = await _seed_logs(
@@ -253,9 +245,7 @@ async def test_summary_empty_range_returns_legal_empty(
     assert data["token_coverage_rate"] is None
 
 
-async def test_trends_day_and_hour_aggregation(
-    client, db_session, admin_user, dashboard_cleanup
-):
+async def test_trends_day_and_hour_aggregation(client, db_session, admin_user, dashboard_cleanup):
     """trends 日/小时粒度聚合正确，桶内统计口径与 summary 一致。"""
     token = await _admin_token(client, admin_user)
     session_ids, turn_ids = await _seed_logs(
@@ -334,9 +324,7 @@ async def test_trends_empty_range(client, db_session, admin_user, dashboard_clea
     assert data["items"] == []
 
 
-async def test_top_questions_ordering(
-    client, db_session, admin_user, dashboard_cleanup
-):
+async def test_top_questions_ordering(client, db_session, admin_user, dashboard_cleanup):
     """top-questions 基于真实问题日志聚合，按频次降序，sample 为最近一次。"""
     token = await _admin_token(client, admin_user)
     session_ids, turn_ids = await _seed_logs(
@@ -377,9 +365,7 @@ async def test_top_questions_ordering(
     assert len(resp2.json()["data"]) == 2
 
 
-async def test_top_documents_from_real_citation(
-    client, db_session, admin_user, dashboard_cleanup
-):
+async def test_top_documents_from_real_citation(client, db_session, admin_user, dashboard_cleanup):
     """top-documents 基于真实 Citation document IDs 聚合，含文档名关联。"""
     token = await _admin_token(client, admin_user)
     session_ids, turn_ids = await _seed_logs(
@@ -438,9 +424,7 @@ async def test_top_documents_from_real_citation(
         assert items[0]["file_name"] == "风险测评指南.pdf"
         assert items[1]["file_name"] is None
     finally:
-        await db_session.execute(
-            delete(ManagedDocument).where(ManagedDocument.id == doc.id)
-        )
+        await db_session.execute(delete(ManagedDocument).where(ManagedDocument.id == doc.id))
         await db_session.commit()
 
 
@@ -469,9 +453,7 @@ async def test_employee_forbidden(client, db_session, tracked_users):
         assert r.status_code == 403, f"{path} -> {r.status_code}"
 
 
-async def test_rank_limit_and_invalid_params(
-    client, db_session, admin_user, dashboard_cleanup
-):
+async def test_rank_limit_and_invalid_params(client, db_session, admin_user, dashboard_cleanup):
     """limit 上限（>100 → 422）与非法日期（→ 422）参数校验。"""
     token = await _admin_token(client, admin_user)
     r = await client.get(

@@ -108,9 +108,7 @@ class GapService:
         )
         return [gap_view(row) for row in rows], total
 
-    async def ignore_gap(
-        self, *, gap_id: str, operator: User, client_ip: str | None
-    ) -> GapView:
+    async def ignore_gap(self, *, gap_id: str, operator: User, client_ip: str | None) -> GapView:
         candidate = await self.gaps.get_by_id(gap_id)
         if candidate is None:
             raise not_found("知识缺口候选不存在")
@@ -118,9 +116,7 @@ class GapService:
             raise conflict("候选已处理，不能重复操作")
         now = utc_now_naive()
         before = self._snapshot(candidate)
-        await self.gaps.mark_ignored(
-            candidate, reviewed_by_user_id=operator.id, reviewed_at=now
-        )
+        await self.gaps.mark_ignored(candidate, reviewed_by_user_id=operator.id, reviewed_at=now)
         await self.audit.record(
             operator_user_id=operator.id,
             action=AuditAction.gap_ignored.value,

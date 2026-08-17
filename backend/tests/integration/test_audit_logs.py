@@ -62,9 +62,7 @@ async def audit_cleanup(db_session):
         await db_session.commit()
 
 
-async def test_audit_pagination_and_sorting(
-    client, db_session, admin_user, audit_cleanup
-):
+async def test_audit_pagination_and_sorting(client, db_session, admin_user, audit_cleanup):
     """分页正确；默认 created_at 降序；sort_order=asc 反转。"""
     token = await _admin_token(client, admin_user)
     ids = await _seed_audit(
@@ -283,7 +281,5 @@ async def test_audit_employee_forbidden(client, db_session, tracked_users):
     await db_session.commit()
     resp = await api_login(client, "audit_emp", "EmpPass#2026")
     token = resp.json()["data"]["access_token"]
-    r = await client.get(
-        "/api/v1/admin/audit-logs", headers=await bearer_headers(token)
-    )
+    r = await client.get("/api/v1/admin/audit-logs", headers=await bearer_headers(token))
     assert r.status_code == 403

@@ -30,6 +30,7 @@ class FakeQueryRag:
     def __init__(self) -> None:
         self.query_calls: list[dict] = []
         self.streams: dict[str, list[tuple[str, dict]]] = {}
+        self.default_stream: list[tuple[str, dict]] | None = None  # 任意未知 session 的兜底流
         self.statuses: dict[str, dict] = {}
         self.traces: dict[str, dict] = {}
         self.stream_delay: float = 0.0
@@ -47,6 +48,10 @@ class FakeQueryRag:
 
     def seed_stream(self, session_id: str, events: list[tuple[str, dict]]) -> None:
         self.streams[session_id] = events
+
+    def seed_default_stream(self, events: list[tuple[str, dict]]) -> None:
+        """为测试内未知 session（路由动态生成的 UUID）提供兜底 SSE 流。"""
+        self.default_stream = events
 
     def seed_status(self, session_id: str, payload: dict) -> None:
         self.statuses[session_id] = payload
@@ -122,7 +127,7 @@ class FakeQueryRag:
             raise httpx.ConnectError("simulated stream socket error", request=None)
         if self.stream_delay > 0:
             await asyncio.sleep(self.stream_delay)
-        events = self.streams.get(session_id, [])
+        events = self.streams.get(session_id, self.default_stream or [])
         body = "".join(_sse_pack(event, data) for event, data in events)
         return httpx.Response(200, content=body, headers=SSE_HEADERS)
 

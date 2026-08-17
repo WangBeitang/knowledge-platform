@@ -65,9 +65,7 @@ async def _seed_logs(
             question=spec.get("question", question),
             normalized_question=normalized,
             normalized_question_hash=h,
-            allowed_scopes_json=spec.get(
-                "allowed_scopes", [scope, "external_public"]
-            ),
+            allowed_scopes_json=spec.get("allowed_scopes", [scope, "external_public"]),
             answer_source=spec.get("answer_source", "rag"),
             faq_id=None,
             rag_trace_id=None,
@@ -102,9 +100,7 @@ async def gap_cleanup(db_session):
 
     for scope in scopes:
         await db_session.execute(
-            delete(KnowledgeGapCandidate).where(
-                KnowledgeGapCandidate.knowledge_scope == scope
-            )
+            delete(KnowledgeGapCandidate).where(KnowledgeGapCandidate.knowledge_scope == scope)
         )
     await db_session.commit()
 
@@ -137,16 +133,12 @@ async def _gap_row(db_session, h: str):
     from app.models.knowledge_gap_candidate import KnowledgeGapCandidate
 
     await db_session.commit()
-    stmt = select(KnowledgeGapCandidate).where(
-        KnowledgeGapCandidate.normalized_question_hash == h
-    )
+    stmt = select(KnowledgeGapCandidate).where(KnowledgeGapCandidate.normalized_question_hash == h)
     return await db_session.scalar(stmt)
 
 
 class TestAnalyze:
-    async def test_no_citation_creates_gap(
-        self, client, admin_user, db_session, gap_cleanup
-    ):
+    async def test_no_citation_creates_gap(self, client, admin_user, db_session, gap_cleanup):
         token = await _admin_token(client, admin_user)
         tag = uuid.uuid4().hex[:8]
         h, scope, _ = await _seed_logs(
@@ -244,9 +236,7 @@ class TestAnalyze:
         assert item["reason_code"] == "insufficient_evidence"
         assert item["ask_count"] == 2
 
-    async def test_failed_or_unavailable_no_gap(
-        self, client, admin_user, db_session, gap_cleanup
-    ):
+    async def test_failed_or_unavailable_no_gap(self, client, admin_user, db_session, gap_cleanup):
         """失败 Turn / RAG 不可用 / timeout / 系统异常均不产生缺口。"""
         token = await _admin_token(client, admin_user)
         tag = uuid.uuid4().hex[:8]
@@ -328,11 +318,7 @@ class TestAnalyze:
                 f"/api/v1/admin/knowledge-gaps?page={page}&page_size=100",
                 headers=await bearer_headers(token),
             )
-            items += [
-                i
-                for i in resp.json()["data"]["items"]
-                if i["normalized_question_hash"] == h
-            ]
+            items += [i for i in resp.json()["data"]["items"] if i["normalized_question_hash"] == h]
         assert len(items) == 1
         assert items[0]["ask_count"] == 3
 
@@ -425,9 +411,12 @@ class TestReview:
         assert resp.status_code == 409, resp.text
 
         # 审计落库
-        assert await _audit_count(
-            db_session, action="gap_ignored", operator_user_id=admin_user["user_id"]
-        ) == 1
+        assert (
+            await _audit_count(
+                db_session, action="gap_ignored", operator_user_id=admin_user["user_id"]
+            )
+            == 1
+        )
 
     async def test_resolve_gap(self, client, admin_user, db_session, gap_cleanup):
         token = await _admin_token(client, admin_user)
@@ -474,13 +463,14 @@ class TestReview:
         )
         assert resp.status_code == 409, resp.text
 
-        assert await _audit_count(
-            db_session, action="gap_resolved", operator_user_id=admin_user["user_id"]
-        ) == 1
+        assert (
+            await _audit_count(
+                db_session, action="gap_resolved", operator_user_id=admin_user["user_id"]
+            )
+            == 1
+        )
 
-    async def test_resolve_empty_body_allowed(
-        self, client, admin_user, db_session, gap_cleanup
-    ):
+    async def test_resolve_empty_body_allowed(self, client, admin_user, db_session, gap_cleanup):
         """resolve 两个字段均可选：无 body / 空对象 / 只有 note 均合法。"""
         token = await _admin_token(client, admin_user)
         tag = uuid.uuid4().hex[:8]
@@ -551,8 +541,10 @@ class TestReview:
     async def test_gap_not_found(self, client, admin_user):
         token = await _admin_token(client, admin_user)
         fake_id = "00000000-0000-0000-0000-000000000000"
-        for path in (f"/api/v1/admin/knowledge-gaps/{fake_id}/ignore",
-                     f"/api/v1/admin/knowledge-gaps/{fake_id}/resolve"):
+        for path in (
+            f"/api/v1/admin/knowledge-gaps/{fake_id}/ignore",
+            f"/api/v1/admin/knowledge-gaps/{fake_id}/resolve",
+        ):
             resp = await client.post(path, headers=await bearer_headers(token), json={})
             assert resp.status_code == 404, resp.text
 
@@ -585,9 +577,9 @@ class TestReview:
         )
         tracked_users.append(emp.id)
         await db_session.commit()
-        emp_token = (await api_login(client, emp.username, "EmpTest#2026")).json()[
-            "data"
-        ]["access_token"]
+        emp_token = (await api_login(client, emp.username, "EmpTest#2026")).json()["data"][
+            "access_token"
+        ]
 
         checks = [
             ("POST", "/api/v1/admin/knowledge-gaps/analyze"),
@@ -605,9 +597,7 @@ class TestReview:
 class TestTimeSemantics:
     """created_at / last_seen_at 来自真实缺口日志时间（数据对象 §4.12 首次/最近发生时间）。"""
 
-    async def test_timestamps_from_real_logs(
-        self, client, admin_user, db_session, gap_cleanup
-    ):
+    async def test_timestamps_from_real_logs(self, client, admin_user, db_session, gap_cleanup):
         token = await _admin_token(client, admin_user)
         tag = uuid.uuid4().hex[:8]
         from datetime import timedelta

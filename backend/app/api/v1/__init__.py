@@ -9,6 +9,7 @@ from app.api.v1 import (
     chunks,
     dashboard,
     documents,
+    external,
     faq_candidates,
     faq_sync_runs,
     faqs,
@@ -26,6 +27,7 @@ router.include_router(integration.router)
 router.include_router(documents.router)
 router.include_router(chunks.router)
 router.include_router(chat.router)
+router.include_router(external.router)
 router.include_router(faq_candidates.router)
 router.include_router(faqs.router)
 router.include_router(faq_sync_runs.router)

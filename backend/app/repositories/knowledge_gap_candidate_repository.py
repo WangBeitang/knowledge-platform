@@ -51,9 +51,7 @@ class KnowledgeGapCandidateRepository(BaseRepository[KnowledgeGapCandidate]):
         if status:
             conditions.append(KnowledgeGapCandidate.status == status)
 
-        count_stmt = (
-            select(func.count()).select_from(KnowledgeGapCandidate).where(*conditions)
-        )
+        count_stmt = select(func.count()).select_from(KnowledgeGapCandidate).where(*conditions)
         total = await self.session.scalar(count_stmt) or 0
         stmt = (
             select(KnowledgeGapCandidate)

@@ -263,9 +263,7 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
         uv = len(
             {
                 identity
-                for identity in (
-                    QaAccessLogRepository._user_identity(r) for r in rows
-                )
+                for identity in (QaAccessLogRepository._user_identity(r) for r in rows)
                 if identity is not None
             }
         )
@@ -306,9 +304,7 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
         channel: str | None = None,
     ) -> dict:
         """summary：区间内真实日志汇总（PV/UV/问答量/成功率/延迟/Token+coverage）。"""
-        rows = await self.list_stats_logs(
-            date_from=date_from, date_to=date_to, channel=channel
-        )
+        rows = await self.list_stats_logs(date_from=date_from, date_to=date_to, channel=channel)
         return self._summary_from_rows(rows)
 
     async def aggregate_by_time(
@@ -320,9 +316,7 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
         granularity: str = "day",
     ) -> list[dict]:
         """trends：按 UTC 日/小时聚合，只返回真实存在日志的桶（不填充空桶）。"""
-        rows = await self.list_stats_logs(
-            date_from=date_from, date_to=date_to, channel=channel
-        )
+        rows = await self.list_stats_logs(date_from=date_from, date_to=date_to, channel=channel)
         buckets: dict[str, list[QaAccessLog]] = {}
         for log in rows:
             if granularity == "hour":
@@ -361,9 +355,7 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
         - sample_question 取组内最近一次（created_at 最大）原始问题；
         - 排序稳定：ask_count 降序、normalized_question 升序。
         """
-        rows = await self.list_stats_logs(
-            date_from=date_from, date_to=date_to, channel=channel
-        )
+        rows = await self.list_stats_logs(date_from=date_from, date_to=date_to, channel=channel)
         groups: dict[str, dict] = {}
         for log in rows:
             group = groups.setdefault(
@@ -376,10 +368,7 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
                 },
             )
             group["ask_count"] += 1
-            if (
-                group["sample_created_at"] is None
-                or log.created_at > group["sample_created_at"]
-            ):
+            if group["sample_created_at"] is None or log.created_at > group["sample_created_at"]:
                 group["sample_question"] = log.question[:500]
                 group["sample_created_at"] = log.created_at
         items = sorted(
@@ -403,16 +392,11 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
         同一 Turn 的 Citation 文档 ID 已去重（chat_service.extract_citation_document_ids），
         每出现一次计 1 次引用；排序稳定：citation_count 降序、document_id 升序。
         """
-        rows = await self.list_stats_logs(
-            date_from=date_from, date_to=date_to, channel=channel
-        )
+        rows = await self.list_stats_logs(date_from=date_from, date_to=date_to, channel=channel)
         counter: Counter = Counter()
         for log in rows:
             for doc_id in log.citation_document_ids_json or []:
                 if isinstance(doc_id, str) and doc_id:
                     counter[doc_id] += 1
         ranked = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
-        return [
-            {"document_id": doc_id, "citation_count": count}
-            for doc_id, count in ranked
-        ]
+        return [{"document_id": doc_id, "citation_count": count} for doc_id, count in ranked]

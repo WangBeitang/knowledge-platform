@@ -16,6 +16,7 @@
 """
 
 import hashlib
+import hmac
 import time
 import uuid
 from datetime import datetime
@@ -67,6 +68,31 @@ def new_jti() -> str:
 def jti_hash(jti: str) -> str:
     """JWT 唯一标识的 SHA-256，只存哈希不存原令牌。"""
     return hashlib.sha256(jti.encode("utf-8")).hexdigest()
+
+
+def external_subject_hash(external_user_id: str) -> str:
+    """外部用户标识的加盐哈希（HMAC-SHA256，64 hex = CHAR(64)）。
+
+    冻结规则（API §10 / 数据对象 §4.6、§4.8）：
+    - 不保存原始外部用户 ID，只保存确定性加盐哈希；
+    - 盐复用现有 `SECRET_KEY`（不新增配置/不写库/不建表）；
+    - 只用于 UV 去重、日志关联与会话映射，不参与知识权限计算。
+    """
+    settings = get_settings()
+    digest = hmac.new(
+        settings.secret_key.encode("utf-8"),
+        external_user_id.encode("utf-8"),
+        hashlib.sha256,
+    )
+    return digest.hexdigest()
+
+
+def verify_service_key(provided: str | None) -> bool:
+    """外部 Service API Key 常量时间校验（冻结 §16：来自 env，不写库/不落日志）。"""
+    expected = get_settings().service_api_key
+    if not expected or not provided:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
 def is_iat_before_password_change(
