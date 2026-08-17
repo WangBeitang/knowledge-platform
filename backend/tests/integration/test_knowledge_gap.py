@@ -38,7 +38,8 @@ async def _seed_logs(
     """插入多条 qa_access_logs（每条 spec 可自定义关键字段），返回 (hash, scope, session_id)。
 
     spec 默认：成功 RAG Turn + 0 citation（no_citation 缺口）。
-    可覆盖：citation_count / terminal_reason_code / answer_source / status / error_code。
+    可覆盖：citation_count / terminal_reason_code / answer_source / status /
+    error_code / created_at（缺口发生时间）。
     """
     first = specs[0]
     question = first["question"]
@@ -79,7 +80,7 @@ async def _seed_logs(
             latency_ms=10,
             status=spec.get("status", "succeeded"),
             error_code=spec.get("error_code"),
-            created_at=utc_now_naive(),
+            created_at=spec.get("created_at", utc_now_naive()),
         )
         db_session.add(log)
     await db_session.commit()
@@ -129,6 +130,17 @@ async def _audit_count(db_session, *, action: str, operator_user_id: str) -> int
         AuditLog.operator_user_id == operator_user_id,
     )
     return len((await db_session.scalars(stmt)).all())
+
+
+async def _gap_row(db_session, h: str):
+    """直接查 DB 的候选行（commit 刷新请求级写后读取，用于精确时间断言）。"""
+    from app.models.knowledge_gap_candidate import KnowledgeGapCandidate
+
+    await db_session.commit()
+    stmt = select(KnowledgeGapCandidate).where(
+        KnowledgeGapCandidate.normalized_question_hash == h
+    )
+    return await db_session.scalar(stmt)
 
 
 class TestAnalyze:
@@ -588,3 +600,116 @@ class TestReview:
                 method, path, headers=await bearer_headers(emp_token), json={}
             )
             assert resp.status_code == 403, (method, path, resp.text)
+
+
+class TestTimeSemantics:
+    """created_at / last_seen_at 来自真实缺口日志时间（数据对象 §4.12 首次/最近发生时间）。"""
+
+    async def test_timestamps_from_real_logs(
+        self, client, admin_user, db_session, gap_cleanup
+    ):
+        token = await _admin_token(client, admin_user)
+        tag = uuid.uuid4().hex[:8]
+        from datetime import timedelta
+
+        t1 = utc_now_naive() - timedelta(days=5)  # 最早缺口日志
+        t2 = utc_now_naive() - timedelta(days=2)  # 最晚缺口日志
+        question = f"时间语义缺口{tag}？"
+        h, scope, _ = await _seed_logs(
+            db_session,
+            user_id=admin_user["user_id"],
+            specs=[
+                {"question": question, "created_at": t1},
+                {"question": question, "created_at": t2},
+            ],
+        )
+        gap_cleanup(scope)
+
+        resp = await client.post(
+            "/api/v1/admin/knowledge-gaps/analyze",
+            headers=await bearer_headers(token),
+            json={},
+        )
+        assert resp.status_code == 200, resp.text
+
+        row = await _gap_row(db_session, h)
+        assert row is not None
+        assert row.created_at == t1
+        assert row.last_seen_at == t2
+
+    async def test_reanalyze_without_new_logs_keeps_timestamps(
+        self, client, admin_user, db_session, gap_cleanup
+    ):
+        """重复 analyze 且没有新缺口日志：created_at / last_seen_at 完全不变。"""
+        token = await _admin_token(client, admin_user)
+        tag = uuid.uuid4().hex[:8]
+        from datetime import timedelta
+
+        t1 = utc_now_naive() - timedelta(days=3)
+        t2 = utc_now_naive() - timedelta(days=1)
+        question = f"时间不变缺口{tag}？"
+        h, scope, _ = await _seed_logs(
+            db_session,
+            user_id=admin_user["user_id"],
+            specs=[
+                {"question": question, "created_at": t1},
+                {"question": question, "created_at": t2},
+            ],
+        )
+        gap_cleanup(scope)
+        for _ in range(2):
+            resp = await client.post(
+                "/api/v1/admin/knowledge-gaps/analyze",
+                headers=await bearer_headers(token),
+                json={},
+            )
+            assert resp.status_code == 200, resp.text
+
+        row = await _gap_row(db_session, h)
+        assert row is not None
+        assert row.created_at == t1
+        assert row.last_seen_at == t2
+
+    async def test_newer_log_updates_only_last_seen(
+        self, client, admin_user, db_session, gap_cleanup
+    ):
+        """再插入更晚缺口日志后 analyze：created_at 不变，last_seen_at 前进。"""
+        token = await _admin_token(client, admin_user)
+        tag = uuid.uuid4().hex[:8]
+        from datetime import timedelta
+
+        t1 = utc_now_naive() - timedelta(days=4)
+        t2 = utc_now_naive() - timedelta(days=2)
+        t3 = utc_now_naive() - timedelta(hours=1)  # 更晚的新缺口日志
+        question = f"时间前进缺口{tag}？"
+        h, scope, _ = await _seed_logs(
+            db_session,
+            user_id=admin_user["user_id"],
+            specs=[
+                {"question": question, "created_at": t1},
+                {"question": question, "created_at": t2},
+            ],
+        )
+        gap_cleanup(scope)
+        await client.post(
+            "/api/v1/admin/knowledge-gaps/analyze",
+            headers=await bearer_headers(token),
+            json={},
+        )
+
+        await _seed_logs(
+            db_session,
+            user_id=admin_user["user_id"],
+            specs=[{"question": question, "created_at": t3}],
+        )
+        await client.post(
+            "/api/v1/admin/knowledge-gaps/analyze",
+            headers=await bearer_headers(token),
+            json={},
+        )
+
+        row = await _gap_row(db_session, h)
+        assert row is not None
+        assert row.created_at == t1  # 最早日志时间永远不变
+        assert row.last_seen_at == t3  # 更新为真实最新缺口日志时间
+        assert row.ask_count == 3

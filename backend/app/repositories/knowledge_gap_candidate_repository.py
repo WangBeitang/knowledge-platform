@@ -75,12 +75,16 @@ class KnowledgeGapCandidateRepository(BaseRepository[KnowledgeGapCandidate]):
         sample_questions: list[str],
         source_log_ids: list[str],
         reason_code: str,
+        first_seen_at: datetime,
         last_seen_at: datetime,
     ) -> KnowledgeGapCandidate:
         """覆盖式 upsert：重复 analyze 更新统计，不重复建行（UNIQUE scope+hash）。
 
+        时间语义（冻结数据对象 §4.12：首次/最近发生时间，来自真实缺口日志）：
+        - 新行：created_at = 最早缺口日志时间，last_seen_at = 最晚缺口日志时间；
+        - 已存在行：created_at 永远不改；last_seen_at 更新为真实最新缺口日志时间；
+        - 重复 analyze 且无新缺口日志时，两个时间天然保持不变（取日志 MIN/MAX）；
         - reason_code 随组内日志更新（可能从 no_citation 变为 insufficient_evidence）；
-        - last_seen_at 更新为最近一次 analyze 时间；
         - status 保留既有值（ignored/resolved 不因重复 analyze 复活）。
         """
         existing = await self.get_by_scope_hash(
@@ -107,7 +111,7 @@ class KnowledgeGapCandidateRepository(BaseRepository[KnowledgeGapCandidate]):
             resolution_note=None,
             resolved_document_id=None,
             reviewed_by_user_id=None,
-            created_at=last_seen_at,
+            created_at=first_seen_at,
             last_seen_at=last_seen_at,
             reviewed_at=None,
         )

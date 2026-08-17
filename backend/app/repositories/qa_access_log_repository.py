@@ -152,7 +152,9 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
           error_code 非空）一律不产生缺口；
         - 组内 reason 优先级：存在 insufficient_evidence 日志取 insufficient_evidence，
           否则 no_citation（同一归一化问题可能同时出现两种日志）；
-        - ask_count = 组内缺口日志条数；有引用的正常日志不计入。
+        - ask_count = 组内缺口日志条数；有引用的正常日志不计入；
+        - first_seen_at / last_seen_at = 组内缺口日志 created_at 的 MIN / MAX
+          （真实发生时间，非 analyze 时刻；数据对象 §4.12：首次/最近发生时间）。
         """
         from app.rag.scope_policy import VALID_SCOPES
 
@@ -187,6 +189,8 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
                     "sample_questions": [],
                     "source_log_ids": [],
                     "reason_code": GAP_REASON_NO_CITATION,
+                    "first_seen_at": log.created_at,
+                    "last_seen_at": log.created_at,
                 },
             )
             group["ask_count"] += 1
@@ -198,6 +202,11 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
                 group["source_log_ids"].append(log.id)
             if len(group["sample_questions"]) > SAMPLE_QUESTIONS_LIMIT:
                 group["sample_questions"] = group["sample_questions"][:SAMPLE_QUESTIONS_LIMIT]
+            # 时间语义：以真实缺口日志时间为准
+            if log.created_at < group["first_seen_at"]:
+                group["first_seen_at"] = log.created_at
+            if log.created_at > group["last_seen_at"]:
+                group["last_seen_at"] = log.created_at
         # 排序稳定：ask_count 降序，hash 升序
         items = sorted(
             groups.values(),

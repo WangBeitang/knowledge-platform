@@ -66,7 +66,6 @@ class GapService:
         groups = await self.logs.aggregate_gap_groups()
         created = 0
         updated = 0
-        now = utc_now_naive()
         for group in groups:
             existed = await self.gaps.get_by_scope_hash(
                 knowledge_scope=group["knowledge_scope"],
@@ -80,7 +79,8 @@ class GapService:
                 sample_questions=group["sample_questions"],
                 source_log_ids=group["source_log_ids"],
                 reason_code=group["reason_code"],
-                last_seen_at=now,
+                first_seen_at=group["first_seen_at"],
+                last_seen_at=group["last_seen_at"],
             )
             if existed is None:
                 created += 1
