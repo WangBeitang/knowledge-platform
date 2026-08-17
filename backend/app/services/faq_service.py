@@ -304,8 +304,9 @@ class FaqService:
     ) -> FaqView:
         """审核并发布：创建正式 FAQ → 审计 → 写缓存 → 触发范围同步。
 
-        写事务顺序（冻结 API §12）：MySQL 业务状态（faq + candidate + audit）成功
-        → Redis 更新 → submit_faq_sync；RAG 同步失败不回滚已审核 FAQ。
+        写事务顺序（冻结 API §12）：MySQL 业务状态（faq + candidate + audit）
+        先真正 commit，commit 成功后才执行 Redis 更新与 submit_faq_sync；
+        MySQL commit 失败时不写 Redis、不调 RAG；Redis/RAG 失败不回滚已提交 FAQ。
         """
         assert self.candidates is not None and self.audit is not None
         candidate = await self.candidates.get_by_id(candidate_id)
@@ -335,7 +336,9 @@ class FaqService:
             after={"faq_id": faq.id, "knowledge_scope": faq.knowledge_scope},
             client_ip=client_ip,
         )
-        # Redis 外部副作用在 MySQL 事务之后
+        # 冻结 §12：MySQL 业务事务先真正 commit（commit 失败 → 不写 Redis/不调 RAG）
+        await self.repository.session.commit()
+        # Redis 外部副作用在 MySQL 事务提交之后
         await self.set_faq_cache(faq)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)
@@ -373,7 +376,8 @@ class FaqService:
     ) -> FaqView:
         """直接创建并发布（POST /admin/faqs）。
 
-        写事务顺序（冻结）：MySQL（faq + audit）成功 → Redis → submit_faq_sync。
+        写事务顺序（冻结）：MySQL（faq + audit）先真正 commit 成功 →
+        Redis → submit_faq_sync；commit 失败不写 Redis/不调 RAG。
         """
         assert self.audit is not None
         faq = await self._create_faq_inner(
@@ -396,6 +400,8 @@ class FaqService:
             },
             client_ip=client_ip,
         )
+        # 冻结 §12：MySQL 业务事务先真正 commit（commit 失败 → 不写 Redis/不调 RAG）
+        await self.repository.session.commit()
         await self.set_faq_cache(faq)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)
@@ -411,7 +417,8 @@ class FaqService:
     ) -> FaqView:
         """更新完整可变字段：问题重算归一化与哈希，答案更新。
 
-        写事务顺序（冻结）：MySQL（faq + audit）成功 → Redis → 触发同步。
+        写事务顺序（冻结）：MySQL（faq + audit）先真正 commit 成功 →
+        Redis → 触发同步；commit 失败不写 Redis/不调 RAG。
         缓存规则（首轮复核）：
         - published：写新 hash cache；问题修改后删除旧 hash cache；
         - unpublished：禁止写 cache，且旧 hash 与新 hash 的 cache 都不存在；
@@ -456,7 +463,9 @@ class FaqService:
             },
             client_ip=client_ip,
         )
-        # Redis 外部副作用在 MySQL 事务之后
+        # 冻结 §12：MySQL 业务事务先真正 commit（commit 失败 → 不写 Redis/不调 RAG）
+        await self.repository.session.commit()
+        # Redis 外部副作用在 MySQL 事务提交之后
         if faq.status == FaqStatus.published.value:
             await self.set_faq_cache(faq)
             if old_hash != new_hash:
@@ -470,9 +479,9 @@ class FaqService:
         return faq_view(faq)
 
     async def unpublish_faq(self, *, faq_id: str, operator: User, client_ip: str | None) -> FaqView:
-        """下线（不物理删除）：MySQL 状态 + 审计成功后删除缓存，再触发范围重建。
+        """下线（不物理删除）：MySQL 状态 + 审计先 commit，再删缓存、触发范围重建。
 
-        写事务顺序（冻结）：MySQL → Redis 删除 → submit_faq_sync。
+        写事务顺序（冻结）：MySQL 先 commit 成功 → Redis 删除 → submit_faq_sync。
         """
         assert self.audit is not None
         faq = await self.repository.get_by_id(faq_id)
@@ -496,12 +505,14 @@ class FaqService:
             after={"knowledge_scope": faq.knowledge_scope},
             client_ip=client_ip,
         )
+        # 冻结 §12：MySQL 业务事务先真正 commit（commit 失败 → 不写 Redis/不调 RAG）
+        await self.repository.session.commit()
         await self.delete_faq_cache(faq.knowledge_scope, faq.normalized_question_hash)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)
 
     async def republish_faq(self, *, faq_id: str, operator: User, client_ip: str | None) -> FaqView:
-        """重新发布：MySQL 状态 + 审计成功后写缓存，再触发范围重建。"""
+        """重新发布：MySQL 状态 + 审计先 commit，再写缓存、触发范围重建。"""
         assert self.audit is not None
         faq = await self.repository.get_by_id(faq_id)
         if faq is None:
@@ -524,6 +535,8 @@ class FaqService:
             after={"knowledge_scope": faq.knowledge_scope},
             client_ip=client_ip,
         )
+        # 冻结 §12：MySQL 业务事务先真正 commit（commit 失败 → 不写 Redis/不调 RAG）
+        await self.repository.session.commit()
         await self.set_faq_cache(faq)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)

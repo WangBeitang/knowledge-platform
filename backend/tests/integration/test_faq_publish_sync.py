@@ -1334,3 +1334,105 @@ class TestFirstReviewFixes:
         rag_doc_id = fake.tasks[rag_task_id]["document_id"]
         fake.set_task_status(rag_task_id, "completed", done=[{"name": "upload_file"}])
         fake.documents[rag_doc_id]["status"] = "completed"
+
+
+class TestTransactionOrder:
+    """写事务顺序（冻结 API §12）：MySQL 业务事务先真正 commit → Redis → RAG。
+
+    请求级 get_db 在路由完成后才 commit；FaqService 各写方法在 audit 之后
+    显式 commit，保证副作用执行时新状态已对外可见，且 commit 失败时副作用为零。
+    """
+
+    async def test_mysql_committed_before_side_effects(
+        self, client, admin_user, db_session, faq_cleanup, faq_rag_factory, monkeypatch
+    ):
+        """Redis 副作用执行时，独立 DB session 已能读到 committed 的新 FAQ 状态。"""
+        faq_rag_factory(FakeRag(), db_session)
+        token = await _admin_token(client, admin_user)
+
+        from app.core.database import get_session_factory
+
+        observed: dict[str, str | None] = {}
+        original_set_cache = FaqService.set_faq_cache
+
+        async def spy_set_faq_cache(self, faq):
+            # 副作用（Redis 写）执行点：用独立 session 读 MySQL，必须已提交
+            async with get_session_factory()() as fresh:
+                row = await fresh.get(Faq, faq.id)
+                observed["status"] = row.status if row else None
+                observed["answer"] = row.answer if row else None
+            return await original_set_cache(self, faq)
+
+        monkeypatch.setattr(FaqService, "set_faq_cache", spy_set_faq_cache)
+
+        resp = await client.post(
+            "/api/v1/admin/faqs",
+            headers=await bearer_headers(token),
+            json={
+                "knowledge_scope": "internal_shared",
+                "question": "事务顺序问题一",
+                "answer": "事务答案一",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        faq = resp.json()["data"]
+        h1 = faq["normalized_question_hash"]
+        faq_cleanup("internal_shared", h1)
+        # Redis 副作用执行时 MySQL 已 commit：独立 session 可读
+        assert observed["status"] == "published"
+        assert observed["answer"] == "事务答案一"
+
+    async def test_mysql_commit_failure_skips_side_effects(
+        self, client, admin_user, db_session, faq_cleanup, faq_rag_factory, monkeypatch
+    ):
+        """业务 commit 失败时：Redis/RAG 副作用调用次数均为 0，请求正常失败。"""
+        fake = faq_rag_factory(FakeRag(), db_session)
+        question = "事务失败问题一"
+
+        # 直接构造 FaqService（与 HTTP 路由同一构造方式），用测试 db_session
+        import_client, document_client = _make_clients(fake)
+        svc = FaqService(
+            repository=FaqRepository(db_session),
+            candidates=FaqCandidateRepository(db_session),
+            audit=AuditService(AuditLogRepository(db_session)),
+            sync_service=FaqSyncService(
+                runs=FaqSyncRunRepository(db_session),
+                faqs=FaqRepository(db_session),
+                import_client=import_client,
+                document_client=document_client,
+            ),
+        )
+
+        # 模拟业务 commit 失败：session.commit 抛异常（在 Redis/RAG 副作用之前）
+        original_commit = db_session.commit
+
+        async def failing_commit():
+            raise RuntimeError("模拟业务 commit 失败")
+
+        monkeypatch.setattr(db_session, "commit", failing_commit)
+
+        with pytest.raises(RuntimeError, match="模拟业务 commit 失败"):
+            await svc.create_faq(
+                knowledge_scope="internal_shared",
+                question=question,
+                answer="事务失败答案",
+                operator=admin_user["user"],
+                client_ip="127.0.0.1",
+            )
+
+        # 恢复 commit（否则后续事务/teardown 受影响）
+        monkeypatch.setattr(db_session, "commit", original_commit)
+
+        # Redis 副作用为 0：新 FAQ 的 cache key 不存在
+        h = question_hash(normalize_question(question))
+        redis = await get_redis()
+        if redis is not None:
+            assert await redis.get(faq_cache_key("internal_shared", h)) is None
+        # RAG 副作用为 0：未触发上传
+        assert fake.upload_calls == 0
+        # MySQL 业务状态未落库（commit 失败，事务回滚）
+        await db_session.rollback()
+        row = await db_session.scalar(
+            select(Faq).where(Faq.knowledge_scope == "internal_shared", Faq.status == "published")
+        )
+        assert row is None or row.normalized_question_hash != h
