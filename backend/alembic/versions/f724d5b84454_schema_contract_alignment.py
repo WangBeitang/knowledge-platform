@@ -9,16 +9,18 @@ v2（修正）：
   避免 MySQL MODIFY 把 NOT NULL 列改可空、丢失默认值；
 - 10 个外键使用稳定明确命名（fk_*），downgrade 可生成完整 SQL。
 """
-from typing import Sequence, Union
 
-from alembic import op
+from collections.abc import Sequence
+
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
 
+from alembic import op
+
 revision: str = "f724d5b84454"
-down_revision: Union[str, None] = "f532646fe643"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "f532646fe643"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 # 全部 DATETIME 列约束（与 app/models 一致）：(列名, nullable, server_default)
 _DATETIME_COLS: dict[str, list[tuple[str, bool, str | None]]] = {
@@ -88,12 +90,30 @@ _FOREIGN_KEYS: list[tuple[str, str, str, list[str], list[str]]] = [
     ("fk_auth_sessions_user", "auth_sessions", "users", ["user_id"], ["id"]),
     ("fk_chat_messages_session", "chat_messages", "chat_sessions", ["session_id"], ["id"]),
     ("fk_chat_sessions_user", "chat_sessions", "users", ["user_id"], ["id"]),
-    ("fk_document_replacements_old", "document_replacements", "managed_documents", ["old_managed_document_id"], ["id"]),
-    ("fk_document_replacements_new", "document_replacements", "managed_documents", ["new_managed_document_id"], ["id"]),
+    (
+        "fk_document_replacements_old",
+        "document_replacements",
+        "managed_documents",
+        ["old_managed_document_id"],
+        ["id"],
+    ),
+    (
+        "fk_document_replacements_new",
+        "document_replacements",
+        "managed_documents",
+        ["new_managed_document_id"],
+        ["id"],
+    ),
     ("fk_faqs_source_candidate", "faqs", "faq_candidates", ["source_candidate_id"], ["id"]),
     ("fk_managed_documents_creator", "managed_documents", "users", ["created_by_user_id"], ["id"]),
     ("fk_qa_access_logs_session", "qa_access_logs", "chat_sessions", ["session_id"], ["id"]),
-    ("fk_rag_integration_tasks_document", "rag_integration_tasks", "managed_documents", ["managed_document_id"], ["id"]),
+    (
+        "fk_rag_integration_tasks_document",
+        "rag_integration_tasks",
+        "managed_documents",
+        ["managed_document_id"],
+        ["id"],
+    ),
 ]
 
 

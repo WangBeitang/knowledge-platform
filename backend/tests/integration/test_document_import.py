@@ -306,6 +306,9 @@ class TestTaskPolling:
         fake.documents[rag_doc_id]["index_version"] = 3
         view = await _poll(client, token, task_id)
         assert view["status"] == "succeeded"
+        # completed 必须用本轮节点（done=本轮响应、running 清空），不沿用上一轮 running 缓存
+        assert [n["name"] for n in view["done_nodes"]] == ["upload_file", "index"]
+        assert view["running_nodes"] == []
 
         await db_session.commit()  # 提交 TaskService 对 doc 的刷新
         from sqlalchemy import select
@@ -333,6 +336,33 @@ class TestTaskPolling:
         view = await _poll(client, token, task_id)
         assert view["status"] == "running"  # 未知状态绝不映射 succeeded
         assert view["rag_status"] == "weird_state"
+
+    async def test_terminal_task_not_overridden_by_upstream_drift(
+        self, client, admin_user, db_session, rag_factory
+    ):
+        """任务二：终态后即使上游状态漂移，平台仍返回持久化终态，不再刷新上游。"""
+        fake = rag_factory(FakeRag(), db_session)
+        token = await _admin_token(client, admin_user)
+        resp = await client.post(
+            "/api/v1/admin/documents/import",
+            headers=await bearer_headers(token),
+            data={"knowledge_scope": "internal_shared"},
+            files=[("files", ("a.pdf", PDF_BYTES, "application/pdf"))],
+        )
+        task_id = resp.json()["data"]["items"][0]["task_id"]
+        rag_task_id = next(iter(fake.tasks))
+
+        fake.set_task_status(rag_task_id, "completed", done=[{"name": "upload_file"}])
+        view = await _poll(client, token, task_id)
+        assert view["status"] == "succeeded"
+
+        # 上游漂移回 processing：终态短路，不得重新覆盖为 running/succeeded
+        fake.set_task_status(rag_task_id, "processing", running=[{"name": "parse_pdf"}])
+        for _ in range(2):
+            view = await _poll(client, token, task_id)
+        assert view["status"] == "succeeded"
+        assert view["running_nodes"] == []
+        assert [n["name"] for n in view["done_nodes"]] == ["upload_file"]
 
     async def test_failed_sets_import_failed(self, client, admin_user, db_session, rag_factory):
         fake = rag_factory(FakeRag(), db_session)

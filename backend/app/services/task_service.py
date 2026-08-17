@@ -99,10 +99,23 @@ class TaskService:
         self.document_client = document_client or get_rag_document_client()
 
     async def get_task(self, task_id: str, *, operator: User) -> IntegrationTaskView:
-        """平台任务 → 上游轮询 → 映射 → 更新 → 刷新文档 → replace 状态机 → 视图。"""
+        """平台任务 → 上游轮询 → 映射 → 更新 → 刷新文档 → replace 状态机 → 视图。
+
+        终态（succeeded/failed/cancelled）不可被重新覆盖：直接返回持久化终态，
+        不再刷新上游（避免 replace 删除旧文档失败后，下一次轮询又按上游 completed 改回 succeeded）。
+        """
         task = await self.tasks.get_by_id(task_id)
         if task is None:
             raise not_found("任务不存在")
+        if task.status in (
+            IntegrationTaskStatus.succeeded.value,
+            IntegrationTaskStatus.failed.value,
+            IntegrationTaskStatus.cancelled.value,
+        ):
+            # updated_at 由 onupdate=func.now()（SQL 表达式）生成，flush 后本地为过期状态；
+            # 返回前必须重新加载，否则触发 async session 懒加载（MissingGreenlet）
+            await self.tasks.session.refresh(task)
+            return task_view(task)
         await self._refresh_from_upstream(task)
         # updated_at 由 onupdate=func.now()（SQL 表达式）生成，flush 后本地为过期状态；
         # 同步构建视图前必须重新加载，否则触发 async session 懒加载（MissingGreenlet）
@@ -141,7 +154,7 @@ class TaskService:
         now = utc_now_naive()
 
         if platform_status == IntegrationTaskStatus.succeeded.value:
-            await self._on_task_succeeded(task, rag_status_raw, now)
+            await self._on_task_succeeded(task, rag_status_raw, done, running, now)
         elif platform_status == IntegrationTaskStatus.failed.value:
             await self._on_task_failed(
                 task,
@@ -168,8 +181,13 @@ class TaskService:
         ):
             await self._drive_replace(task)
 
-    async def _on_task_succeeded(self, task: RagIntegrationTask, rag_status_raw: str, now) -> None:
-        """上游 completed：必须再读真实 Document 快照，成功后 platform_status=active。"""
+    async def _on_task_succeeded(
+        self, task: RagIntegrationTask, rag_status_raw: str, done: list, running: list, now
+    ) -> None:
+        """上游 completed：必须再读真实 Document 快照，成功后 platform_status=active。
+
+        done/running 使用本轮上游响应（completed 时 running 必为空），不沿用上一轮缓存。
+        """
         rag_document_id = task.rag_document_id
         doc = await self.docs.get_by_rag_document_id(rag_document_id) if rag_document_id else None
         snapshot = None
@@ -182,8 +200,8 @@ class TaskService:
             await self.tasks.update_from_upstream(
                 task,
                 rag_status=rag_status_raw,
-                done_nodes=task.done_nodes_json or [],
-                running_nodes=task.running_nodes_json or [],
+                done_nodes=done,
+                running_nodes=running,
                 failed_node=None,
                 status=IntegrationTaskStatus.failed.value,
                 error_code="RAG_BAD_RESPONSE",
@@ -206,8 +224,8 @@ class TaskService:
         await self.tasks.update_from_upstream(
             task,
             rag_status=rag_status_raw,
-            done_nodes=task.done_nodes_json or [],
-            running_nodes=task.running_nodes_json or [],
+            done_nodes=done,
+            running_nodes=running,
             failed_node=None,
             status=IntegrationTaskStatus.succeeded.value,
             error_code=None,

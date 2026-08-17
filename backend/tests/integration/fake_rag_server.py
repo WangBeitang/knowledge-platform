@@ -130,6 +130,9 @@ class FakeRag:
             task["done_list"] = done
         if running is not None:
             task["running_list"] = running
+        elif status in ("completed", "failed", "cancelled"):
+            # 真实上游终态 running_list 必为空（任务结束无 running 节点）
+            task["running_list"] = []
         if failed_node is not None:
             task["failed_node"] = failed_node
         if error_code is not None:
@@ -285,9 +288,9 @@ class FakeRag:
             return httpx.Response(404, json={"detail": "文档不存在"})
         if doc.get("status") in ("deleted", "import_failed"):
             return httpx.Response(409, json={"detail": "文档状态不允许删除"})
+        self.delete_calls += 1  # 删除尝试次数（含失败分支，供"只尝试一次"断言）
         if self.fail_delete:
             return httpx.Response(409, json={"detail": "模拟上游删除失败"})
-        self.delete_calls += 1
         doc["status"] = "deleted"
         return httpx.Response(
             200,

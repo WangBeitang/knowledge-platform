@@ -69,6 +69,17 @@ def _latest_event(item: dict) -> dict:
     return event if isinstance(event, dict) else {}
 
 
+def _chunk_index_version(item: dict, *, fallback: int) -> int:
+    """index_version 优先取上游 item.index_version，只有缺失时才 fallback 平台映射版本。"""
+    raw = item.get("index_version")
+    if raw is None:
+        return fallback
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def chunk_view_from_list_item(
     item: dict, *, platform_document_id: str, index_version: int
 ) -> ChunkView:
@@ -76,7 +87,7 @@ def chunk_view_from_list_item(
     return ChunkView(
         chunk_id=str(item.get("chunk_id") or ""),
         document_id=platform_document_id,
-        index_version=index_version,
+        index_version=_chunk_index_version(item, fallback=index_version),
         position=int(item.get("chunk_index") or 0),
         text=str(item.get("content_preview") or item.get("content") or ""),
         enabled=bool(item.get("effective_enabled", True)),
@@ -93,7 +104,7 @@ def chunk_view_from_detail(
     return ChunkView(
         chunk_id=str(item.get("chunk_id") or ""),
         document_id=platform_document_id,
-        index_version=index_version,
+        index_version=_chunk_index_version(item, fallback=index_version),
         position=int(item.get("chunk_index") or 0),
         text=str(item.get("content") or ""),
         enabled=bool(item.get("effective_enabled", True)),

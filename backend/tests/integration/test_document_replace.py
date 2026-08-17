@@ -240,9 +240,13 @@ class TestReplace:
         new_rag_doc = [d for d in fake.documents.values() if d["document_id"] != "old_doc_1"][0]
         fake.set_task_status(new_rag_doc["latest_task_id"], "completed")
 
-        task_view = await _poll_task(client, token, data["task_id"])
+        # 连续 GET 3 次：终态不可被重新覆盖——上游仍是 completed，
+        # 但任务/replacement 必须保持 failed，且旧文档删除只尝试一次
+        for _ in range(3):
+            task_view = await _poll_task(client, token, data["task_id"])
         assert task_view["status"] == "failed"
         assert "旧文档清理失败" in (task_view["error_message"] or "")
+        assert fake.delete_calls == 1
 
         old_after = await _read_doc(db_session, old.id)
         new_doc = await _read_doc(db_session, data["new_document_id"])

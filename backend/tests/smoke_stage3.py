@@ -17,7 +17,13 @@ import httpx
 
 BASE = "http://127.0.0.1:8000/api/v1"
 
-MINIMAL_PDF = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF"
+MINIMAL_PDF = (
+    b"%PDF-1.4\n"
+    b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n"
+    b"trailer<</Root 1 0 R>>\n%%EOF"
+)
 
 passed: list[str] = []
 failed: list[str] = []
@@ -51,7 +57,9 @@ def main() -> int:
     data = r.json()["data"]
     check("导入 submitted_count=1", data["submitted_count"] == 1, str(data))
     item = data["items"][0]
-    check("导入 item pending 且含 task_id", item["status"] == "pending" and item["task_id"], str(item))
+    check(
+        "导入 item pending 且含 task_id", item["status"] == "pending" and item["task_id"], str(item)
+    )
     task_id = item["task_id"]
     document_id = item["document_id"]
 
@@ -70,11 +78,18 @@ def main() -> int:
     r = c.get("/admin/documents", headers=headers)
     check("文档列表 200", r.status_code == 200)
     docs = r.json()["data"]["items"]
-    check("列表含新文档且 active", any(d["id"] == document_id and d["platform_status"] == "active" for d in docs))
+    check(
+        "列表含新文档且 active",
+        any(d["id"] == document_id and d["platform_status"] == "active" for d in docs),
+    )
     r = c.get(f"/admin/documents/{document_id}", headers=headers)
     check("文档详情 200", r.status_code == 200)
     detail = r.json()["data"]
-    check("详情 chunk_count=5", detail.get("chunk_count") == 5, f"chunk_count={detail.get('chunk_count')}")
+    check(
+        "详情 chunk_count=5",
+        detail.get("chunk_count") == 5,
+        f"chunk_count={detail.get('chunk_count')}",
+    )
 
     print("== 5. Chunk 分页（offset 生效）==")
     p1 = c.get(f"/admin/documents/{document_id}/chunks?page=1&page_size=2", headers=headers)
@@ -84,11 +99,17 @@ def main() -> int:
     items1 = p1.json()["data"]["items"]
     items2 = p2.json()["data"]["items"]
     check("第1页 2 条", len(items1) == 2, f"len={len(items1)}")
-    check("第2页 2 条且与第1页不同", len(items2) == 2 and items1[0]["chunk_id"] != items2[0]["chunk_id"],
-          f"p1={[i['chunk_id'] for i in items1]} p2={[i['chunk_id'] for i in items2]}")
+    check(
+        "第2页 2 条且与第1页不同",
+        len(items2) == 2 and items1[0]["chunk_id"] != items2[0]["chunk_id"],
+        f"p1={[i['chunk_id'] for i in items1]} p2={[i['chunk_id'] for i in items2]}",
+    )
     check("total=5", p1.json()["data"]["total"] == 5, str(p1.json()["data"]["total"]))
-    check("position 连续", items1[0]["position"] == 0 and items2[0]["position"] == 2,
-          f"p1 pos={items1[0]['position']} p2 pos={items2[0]['position']}")
+    check(
+        "position 连续",
+        items1[0]["position"] == 0 and items2[0]["position"] == 2,
+        f"p1 pos={items1[0]['position']} p2 pos={items2[0]['position']}",
+    )
 
     print("== 6. Chunk 启停 ==")
     chunk = items1[0]
@@ -124,7 +145,11 @@ def main() -> int:
         data={"knowledge_scope": "internal_shared"},
         files={"file": ("demo_smoke_v2.pdf", io.BytesIO(MINIMAL_PDF), "application/pdf")},
     )
-    check("替换返回 202 + task_id", r.status_code == 202 and r.json()["data"].get("task_id"), f"HTTP {r.status_code}: {r.text[:300]}")
+    check(
+        "替换返回 202 + task_id",
+        r.status_code == 202 and r.json()["data"].get("task_id"),
+        f"HTTP {r.status_code}: {r.text[:300]}",
+    )
     replace_task_id = r.json()["data"]["task_id"]
     new_document_id = r.json()["data"]["new_document_id"]
     replace_status = None
@@ -137,12 +162,19 @@ def main() -> int:
         time.sleep(1)
     check("替换任务 succeeded", replace_status == "succeeded", f"status={replace_status}")
     r = c.get(f"/admin/documents/{document_id}", headers=headers)
-    check("旧文档详情 404（终态不可操作）", r.status_code == 404, f"HTTP {r.status_code}: {r.text[:200]}")
+    check(
+        "旧文档详情 404（终态不可操作）",
+        r.status_code == 404,
+        f"HTTP {r.status_code}: {r.text[:200]}",
+    )
     r = c.get("/admin/documents?platform_status=replaced", headers=headers)
     docs = r.json()["data"]["items"]
     old_view = next((d for d in docs if d["id"] == document_id), None)
-    check("旧文档列表标记 replaced", old_view is not None and old_view["platform_status"] == "replaced",
-          f"old_view={old_view}")
+    check(
+        "旧文档列表标记 replaced",
+        old_view is not None and old_view["platform_status"] == "replaced",
+        f"old_view={old_view}",
+    )
     r = c.get(f"/admin/documents/{new_document_id}", headers=headers)
     check("新文档 active", r.status_code == 200 and r.json()["data"]["platform_status"] == "active")
 
@@ -154,8 +186,11 @@ def main() -> int:
     r = c.get("/admin/documents?platform_status=deleted", headers=headers)
     docs = r.json()["data"]["items"]
     new_view = next((d for d in docs if d["id"] == new_document_id), None)
-    check("删除后列表标记 deleted", new_view is not None and new_view["platform_status"] == "deleted",
-          f"new_view={new_view}")
+    check(
+        "删除后列表标记 deleted",
+        new_view is not None and new_view["platform_status"] == "deleted",
+        f"new_view={new_view}",
+    )
 
     print()
     print(f"通过 {len(passed)} 项，失败 {len(failed)} 项")

@@ -27,6 +27,27 @@ const chunkTotal = ref(0)
 const chunkPage = ref(1)
 const chunkPageSize = ref(20)
 
+// ===== Chunk 完整正文（只读 Drawer）=====
+const chunkDrawer = reactive({
+  visible: false,
+  loading: false,
+  chunk: null as ChunkView | null,
+})
+
+async function openChunkDetail(chunk: ChunkView): Promise<void> {
+  chunkDrawer.visible = true
+  chunkDrawer.loading = true
+  chunkDrawer.chunk = null
+  try {
+    const resp = await chunksApi.getChunk(documentId, chunk.chunk_id)
+    chunkDrawer.chunk = resp.data
+  } catch (err) {
+    ElMessage.error(err instanceof ApiError ? err.message : '加载 Chunk 正文失败')
+  } finally {
+    chunkDrawer.loading = false
+  }
+}
+
 // ===== 启停对话框 =====
 const enabledDialog = reactive({
   visible: false,
@@ -136,6 +157,13 @@ async function submitEnabled(): Promise<void> {
     enabledDialog.visible = false
     await fetchChunks()
   } catch (err) {
+    if (err instanceof ApiError && err.code === 'INDEX_VERSION_CONFLICT') {
+      // 文档已重新索引：提示并刷新，禁止自动重新 PATCH
+      enabledDialog.visible = false
+      ElMessage.warning('文档已重新索引，请刷新后再操作')
+      await Promise.all([fetchDocument(), fetchChunks()])
+      return
+    }
     ElMessage.error(err instanceof ApiError ? err.message : '操作失败')
   } finally {
     savingEnabled.value = false
@@ -450,10 +478,18 @@ onMounted(() => {
           </el-table-column>
           <el-table-column
             label="操作"
-            width="110"
+            width="150"
             fixed="right"
           >
             <template #default="{ row }">
+              <el-button
+                link
+                type="primary"
+                size="small"
+                @click="openChunkDetail(row)"
+              >
+                查看
+              </el-button>
               <el-button
                 link
                 type="primary"
@@ -562,6 +598,53 @@ onMounted(() => {
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- Chunk 完整正文（只读） -->
+    <el-drawer
+      v-model="chunkDrawer.visible"
+      title="Chunk 正文"
+      size="480px"
+    >
+      <div
+        v-loading="chunkDrawer.loading"
+        class="chunk-drawer-body"
+      >
+        <template v-if="chunkDrawer.chunk">
+          <el-descriptions
+            :column="2"
+            border
+          >
+            <el-descriptions-item label="序号">
+              {{ chunkDrawer.chunk.position }}
+            </el-descriptions-item>
+            <el-descriptions-item label="状态">
+              <el-tag
+                :type="chunkDrawer.chunk.enabled ? 'success' : 'info'"
+                size="small"
+                effect="plain"
+              >
+                {{ chunkDrawer.chunk.enabled ? '启用' : '停用' }}
+              </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item
+              v-if="chunkDrawer.chunk.disabled_reason_code"
+              label="停用原因"
+              :span="2"
+            >
+              {{ chunkDrawer.chunk.disabled_reason_code }}{{ chunkDrawer.chunk.disabled_reason_text ? `: ${chunkDrawer.chunk.disabled_reason_text}` : '' }}
+            </el-descriptions-item>
+          </el-descriptions>
+          <div class="chunk-text-title">
+            正文（只读）
+          </div>
+          <pre class="chunk-text">{{ chunkDrawer.chunk.text }}</pre>
+        </template>
+        <el-empty
+          v-else-if="!chunkDrawer.loading"
+          description="暂无内容"
+        />
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -614,5 +697,30 @@ onMounted(() => {
 
 .replace-tip {
   margin-bottom: 14px;
+}
+
+.chunk-drawer-body {
+  min-height: 200px;
+}
+
+.chunk-text-title {
+  margin: 16px 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--kp-text);
+}
+
+.chunk-text {
+  margin: 0;
+  padding: 12px;
+  background: var(--kp-bg);
+  border: 1px solid var(--kp-border);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--kp-text);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

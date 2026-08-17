@@ -61,24 +61,34 @@ function stopPolling(): void {
   pollingTaskIds.clear()
 }
 
+function isTerminal(view: IntegrationTaskView | null): boolean {
+  return view !== null && ['succeeded', 'failed', 'cancelled'].includes(view.status)
+}
+
 async function pollOnce(): Promise<void> {
   let active = false
   for (const entry of tasks.value) {
+    if (entry.item.status === 'rejected') continue // 请求级拒绝，无任务可查
+    if (isTerminal(entry.view)) continue // 已终态：永久停止该 task
     const taskId = entry.item.task_id
-    if (!taskId || entry.item.status !== 'pending') continue
-    if (pollingTaskIds.has(taskId)) continue
+    if (!taskId) continue
+    if (pollingTaskIds.has(taskId)) {
+      active = true
+      continue
+    }
     pollingTaskIds.add(taskId)
     active = true
     try {
       const resp = await getTask(taskId)
       entry.view = resp.data
-      if (resp.data.status === 'succeeded' || resp.data.status === 'failed' || resp.data.status === 'cancelled') {
+      if (isTerminal(resp.data)) {
         pollingTaskIds.delete(taskId)
       }
     } catch {
       pollingTaskIds.delete(taskId) // 下一次继续尝试
     }
   }
+  // 全部任务终态/rejected 后停止轮询
   if (!active && timer) {
     stopPolling()
   }
