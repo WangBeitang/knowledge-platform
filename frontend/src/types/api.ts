@@ -363,3 +363,63 @@ export interface GapAnalyzeData {
   created: number
   updated: number
 }
+
+// ========== Stage 5 Batch 3：运营看板 + 审计查询 ==========
+
+export interface DashboardSummary {
+  pv_count: number
+  uv_count: number
+  question_count: number
+  success_rate: number | null
+  avg_latency_ms: number | null
+  token_input_total: number | null
+  token_output_total: number | null
+  token_total: number | null
+  token_coverage_rate: number | null
+}
+
+export interface DashboardTrendItem {
+  bucket: string
+  pv_count: number
+  uv_count: number
+  question_count: number
+  success_rate: number | null
+  avg_latency_ms: number | null
+  token_total: number | null
+  token_coverage_rate: number | null
+}
+
+export interface DashboardTrendsData {
+  granularity: 'day' | 'hour'
+  items: DashboardTrendItem[]
+}
+
+export interface TopQuestionItem {
+  normalized_question: string
+  sample_question: string | null
+  ask_count: number
+}
+
+export interface TopDocumentItem {
+  document_id: string
+  file_name: string | null
+  citation_count: number
+}
+
+export type AuditResult = 'succeeded' | 'failed'
+
+export interface AuditLogView {
+  id: string
+  request_id: string
+  operator_user_id: string
+  operator_username: string | null
+  action: string
+  resource_type: string
+  resource_id: string | null
+  result: AuditResult
+  error_code: string | null
+  client_ip: string | null
+  before: Record<string, unknown> | null
+  after: Record<string, unknown> | null
+  created_at: string | null
+}

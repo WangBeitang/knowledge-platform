@@ -6,8 +6,10 @@ import {
   Clock,
   Collection,
   Connection,
+  DataAnalysis,
   Document,
   HomeFilled,
+  List,
   QuestionFilled,
   UploadFilled,
   User,
@@ -31,6 +33,8 @@ const adminMenu = [
   { path: '/admin/faqs', label: 'FAQ 管理', icon: Collection },
   { path: '/admin/faq-sync-runs', label: 'FAQ 同步', icon: Clock },
   { path: '/admin/knowledge-gaps', label: '知识缺口', icon: Warning },
+  { path: '/admin/dashboard', label: '运营看板', icon: DataAnalysis },
+  { path: '/admin/audit-logs', label: '审计日志', icon: List },
   { path: '/admin/integration', label: '系统集成', icon: Connection },
 ]
 

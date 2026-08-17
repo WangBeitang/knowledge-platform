@@ -1,5 +1,6 @@
 """qa_access_logs 数据访问：每个接受处理的 Turn 恰好一条日志。"""
 
+from collections import Counter
 from datetime import datetime
 
 from sqlalchemy import select, update
@@ -213,3 +214,205 @@ class QaAccessLogRepository(BaseRepository[QaAccessLog]):
             key=lambda g: (-g["ask_count"], g["normalized_question_hash"]),
         )
         return items
+
+    # ---- Stage 5 Batch 3：运营看板（《API 接口设计》§13.2）----
+    # V1 冻结口径：无物化统计 Worker，直接基于现有 MySQL 查询 +
+    # 进程内聚合（与 aggregate_by_hash / aggregate_gap_groups 同一模式）。
+    # 时间边界由调用方解析为 UTC naive（qa_access_logs.created_at 为 UTC naive）。
+
+    async def list_stats_logs(
+        self,
+        *,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        channel: str | None = None,
+    ) -> list[QaAccessLog]:
+        """按冻结通用过滤（date_from/date_to/channel）取回看板统计所需日志。"""
+        conditions = []
+        if date_from is not None:
+            conditions.append(QaAccessLog.created_at >= date_from)
+        if date_to is not None:
+            conditions.append(QaAccessLog.created_at <= date_to)
+        if channel:
+            conditions.append(QaAccessLog.channel == channel)
+        stmt = select(QaAccessLog).where(*conditions)
+        return list((await self.session.scalars(stmt)).all())
+
+    @staticmethod
+    def _user_identity(log: QaAccessLog) -> str | None:
+        """统一用户身份：内部用户优先，外部匿名走 hash；两者皆空视为匿名。"""
+        if log.user_id:
+            return f"u:{log.user_id}"
+        if log.external_subject_hash:
+            return f"e:{log.external_subject_hash}"
+        return None
+
+    @staticmethod
+    def _summary_from_rows(rows: list[QaAccessLog]) -> dict:
+        """单区间汇总（summary 与 trends 单桶共用同一口径）。
+
+        冻结口径：
+        - pv_count = 日志条数；uv_count = 独立用户身份数；
+        - question_count = status=succeeded 轮次数；
+        - success_rate / avg_latency_ms 空区间为 None（不伪造 0）；
+        - Token 只累加真实回填值，全 NULL 返回 None；coverage_rate = 完整
+          total_tokens 条数 / 总条数（空区间 None）。
+        """
+        total = len(rows)
+        pv = total
+        uv = len(
+            {
+                identity
+                for identity in (
+                    QaAccessLogRepository._user_identity(r) for r in rows
+                )
+                if identity is not None
+            }
+        )
+        succeeded = sum(1 for r in rows if r.status == "succeeded")
+        if total == 0:
+            return {
+                "pv_count": 0,
+                "uv_count": 0,
+                "question_count": 0,
+                "success_rate": None,
+                "avg_latency_ms": None,
+                "token_input_total": None,
+                "token_output_total": None,
+                "token_total": None,
+                "token_coverage_rate": None,
+            }
+        token_input = [r.input_tokens for r in rows if r.input_tokens is not None]
+        token_output = [r.output_tokens for r in rows if r.output_tokens is not None]
+        token_total = [r.total_tokens for r in rows if r.total_tokens is not None]
+        coverage = sum(1 for r in rows if r.total_tokens is not None) / total
+        return {
+            "pv_count": pv,
+            "uv_count": uv,
+            "question_count": succeeded,
+            "success_rate": round(succeeded / total, 4),
+            "avg_latency_ms": round(sum(r.latency_ms for r in rows) / total, 2),
+            "token_input_total": sum(token_input) if token_input else None,
+            "token_output_total": sum(token_output) if token_output else None,
+            "token_total": sum(token_total) if token_total else None,
+            "token_coverage_rate": round(coverage, 4),
+        }
+
+    async def aggregate_summary(
+        self,
+        *,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        channel: str | None = None,
+    ) -> dict:
+        """summary：区间内真实日志汇总（PV/UV/问答量/成功率/延迟/Token+coverage）。"""
+        rows = await self.list_stats_logs(
+            date_from=date_from, date_to=date_to, channel=channel
+        )
+        return self._summary_from_rows(rows)
+
+    async def aggregate_by_time(
+        self,
+        *,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        channel: str | None = None,
+        granularity: str = "day",
+    ) -> list[dict]:
+        """trends：按 UTC 日/小时聚合，只返回真实存在日志的桶（不填充空桶）。"""
+        rows = await self.list_stats_logs(
+            date_from=date_from, date_to=date_to, channel=channel
+        )
+        buckets: dict[str, list[QaAccessLog]] = {}
+        for log in rows:
+            if granularity == "hour":
+                key = log.created_at.replace(minute=0, second=0, microsecond=0)
+                bucket = key.isoformat() + "+00:00"
+            else:
+                bucket = log.created_at.date().isoformat()
+            buckets.setdefault(bucket, []).append(log)
+        items = []
+        for bucket in sorted(buckets):
+            stat = self._summary_from_rows(buckets[bucket])
+            items.append(
+                {
+                    "bucket": bucket,
+                    "pv_count": stat["pv_count"],
+                    "uv_count": stat["uv_count"],
+                    "question_count": stat["question_count"],
+                    "success_rate": stat["success_rate"],
+                    "avg_latency_ms": stat["avg_latency_ms"],
+                    "token_total": stat["token_total"],
+                    "token_coverage_rate": stat["token_coverage_rate"],
+                }
+            )
+        return items
+
+    async def aggregate_by_question(
+        self,
+        *,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        channel: str | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """top-questions：按归一化问题 hash 聚合真实问题日志，频次降序。
+
+        - sample_question 取组内最近一次（created_at 最大）原始问题；
+        - 排序稳定：ask_count 降序、normalized_question 升序。
+        """
+        rows = await self.list_stats_logs(
+            date_from=date_from, date_to=date_to, channel=channel
+        )
+        groups: dict[str, dict] = {}
+        for log in rows:
+            group = groups.setdefault(
+                log.normalized_question_hash,
+                {
+                    "normalized_question": log.normalized_question,
+                    "sample_question": None,
+                    "sample_created_at": None,
+                    "ask_count": 0,
+                },
+            )
+            group["ask_count"] += 1
+            if (
+                group["sample_created_at"] is None
+                or log.created_at > group["sample_created_at"]
+            ):
+                group["sample_question"] = log.question[:500]
+                group["sample_created_at"] = log.created_at
+        items = sorted(
+            groups.values(),
+            key=lambda g: (-g["ask_count"], g["normalized_question"]),
+        )
+        for item in items:
+            item.pop("sample_created_at", None)
+        return items[:limit]
+
+    async def aggregate_by_citation(
+        self,
+        *,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        channel: str | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """top-documents：展开真实 citation_document_ids_json 计数，引用频次降序。
+
+        同一 Turn 的 Citation 文档 ID 已去重（chat_service.extract_citation_document_ids），
+        每出现一次计 1 次引用；排序稳定：citation_count 降序、document_id 升序。
+        """
+        rows = await self.list_stats_logs(
+            date_from=date_from, date_to=date_to, channel=channel
+        )
+        counter: Counter = Counter()
+        for log in rows:
+            for doc_id in log.citation_document_ids_json or []:
+                if isinstance(doc_id, str) and doc_id:
+                    counter[doc_id] += 1
+        ranked = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+        return [
+            {"document_id": doc_id, "citation_count": count}
+            for doc_id, count in ranked
+        ]

@@ -3,9 +3,11 @@
 from fastapi import APIRouter
 
 from app.api.v1 import (
+    audit_logs,
     auth,
     chat,
     chunks,
+    dashboard,
     documents,
     faq_candidates,
     faq_sync_runs,
@@ -28,3 +30,5 @@ router.include_router(faq_candidates.router)
 router.include_router(faqs.router)
 router.include_router(faq_sync_runs.router)
 router.include_router(knowledge_gaps.router)
+router.include_router(dashboard.router)
+router.include_router(audit_logs.router)

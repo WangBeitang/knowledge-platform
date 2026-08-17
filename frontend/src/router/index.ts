@@ -81,6 +81,18 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '知识缺口', adminOnly: true },
       },
       {
+        path: 'admin/dashboard',
+        name: 'admin-dashboard',
+        component: () => import('@/views/admin/DashboardView.vue'),
+        meta: { title: '运营看板', adminOnly: true },
+      },
+      {
+        path: 'admin/audit-logs',
+        name: 'admin-audit-logs',
+        component: () => import('@/views/admin/AuditLogsView.vue'),
+        meta: { title: '审计日志', adminOnly: true },
+      },
+      {
         path: 'home',
         name: 'home',
         component: () => import('@/views/employee/HomeView.vue'),
