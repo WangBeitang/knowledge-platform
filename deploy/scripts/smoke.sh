@@ -72,6 +72,35 @@ print(eval(sys.argv[2], {"data": data}))
 PY
 }
 
+# sse_error_code <sse_text>：取最后一个 error 事件的稳定错误码（安全展示，不泄漏内部异常）
+sse_error_code() {
+  echo "$1" | python3 -c '
+import json, sys
+last_code = "UNKNOWN"
+for line in sys.stdin.read().splitlines():
+    parts = line.split("\t", 1)
+    if len(parts) == 2 and parts[0] == "error":
+        try:
+            last_code = str(json.loads(parts[1]).get("code") or "UNKNOWN")
+        except Exception:
+            last_code = "UNKNOWN"
+print(last_code)
+'
+}
+
+# assert_final <sse_text> <场景说明>：正常 RAG 问答必须唯一 final 终态；
+# error → 打印安全错误码并使脚本返回非 0（同时保持 final/error 互斥检查）
+assert_final() {
+  local text=$1 desc=$2
+  local ev last fin err
+  ev=$(sse_events "$text")
+  last=$(echo "$ev" | tail -1 | cut -f1)
+  fin=$(echo "$ev" | cut -f1 | grep -c '^final$' || true)
+  err=$(echo "$ev" | cut -f1 | grep -c '^error$' || true)
+  [ $((fin + err)) -eq 1 ] || fail "${desc} final/error 未互斥（final=$fin error=$err）"
+  [ "$last" = "final" ] || fail "${desc} 未得到 final（终态=${last}，安全错误码=$(sse_error_code "$text")）"
+}
+
 gen_test_pdf() { # gen_test_pdf <path>
   python3 - "$1" <<'PY'
 import sys
@@ -205,15 +234,9 @@ http POST "/api/v1/chat/sessions/$SID/messages:stream" -H "$AUTH" \
   -H 'Content-Type: application/json' -H 'Accept: text/event-stream' \
   -d "{\"question\":\"$Q8\"}"
 [ "$HTTP_CODE" = "200" ] || fail "内部问答 SSE HTTP=$HTTP_CODE body=$HTTP_BODY"
-ev8=$(sse_events "$HTTP_BODY")
-n8=$(echo "$ev8" | grep -c $'\t' || true)
-last8=$(echo "$ev8" | tail -1 | cut -f1)
-fin8=$(echo "$ev8" | cut -f1 | grep -c '^final$' || true)
-err8=$(echo "$ev8" | cut -f1 | grep -c '^error$' || true)
-echo "    events=$n8 last=$last8 final=$fin8 error=$err8"
-[ "$last8" = "final" ] || [ "$last8" = "error" ] || fail "内部问答缺少唯一终态事件"
-[ $((fin8 + err8)) -eq 1 ] || fail "final/error 未互斥（final=$fin8 error=${err8}）"
-pass "内部问答 SSE 终态唯一（${last8}）"
+# 正常 RAG 问答必须得到唯一 final；error → 打印安全错误码并失败
+assert_final "$HTTP_BODY" "内部 RAG 问答"
+pass "内部问答 SSE final 唯一"
 
 # ---------- 9. FAQ 发布 + 精确命中（外部 API，同时覆盖外部合法 SSE） ----------
 echo "==> [9/16] FAQ 发布与精确命中"
@@ -298,14 +321,9 @@ http POST /api/v1/external/knowledge/messages:stream \
   -H 'Accept: text/event-stream' \
   -d "{\"external_session_id\":\"${PREFIX}_sess2\",\"external_user_id\":\"smoke_user\",\"question\":\"$Q14\"}"
 [ "$HTTP_CODE" = "200" ] || fail "外部合法请求 HTTP=$HTTP_CODE body=$HTTP_BODY"
-ev14=$(sse_events "$HTTP_BODY")
-last14=$(echo "$ev14" | tail -1 | cut -f1)
-fin14=$(echo "$ev14" | cut -f1 | grep -c '^final$' || true)
-err14=$(echo "$ev14" | cut -f1 | grep -c '^error$' || true)
-[ "$last14" = "final" ] || [ "$last14" = "error" ] || fail "外部 SSE 缺少唯一终态"
-[ $((fin14 + err14)) -eq 1 ] || fail "外部 final/error 未互斥"
-echo "    外部 SSE 终态=${last14}（final=${fin14} error=${err14}）"
-pass "外部合法请求 SSE 完成（${last14}）"
+# 外部合法、FAQ 未命中的 RAG 问答必须得到唯一 final；error → 打印安全错误码并失败
+assert_final "$HTTP_BODY" "外部 RAG 问答"
+pass "外部合法请求 SSE final"
 
 # ---------- 15. 外部 dataset_ids → 422 ----------
 echo "==> [15/16] 外部 dataset_ids 越权 422"
@@ -329,15 +347,17 @@ http POST /api/v1/external/knowledge/messages:stream \
   -H 'Accept: text/event-stream' \
   -d "{\"external_session_id\":\"${PREFIX}_sess3\",\"external_user_id\":\"smoke_user\",\"question\":\"$INT_Q\"}"
 [ "$HTTP_CODE" = "200" ] || fail "外部 internal 探测 HTTP=$HTTP_CODE body=$HTTP_BODY"
+# 该请求是外部 FAQ 未命中的 RAG 问答：必须 final（error → 打印安全错误码并失败），
+# 同时校验未命中 internal（answer_source 不得为 faq_cache，越权防护）
+assert_final "$HTTP_BODY" "外部 internal 范围探测"
 ev16=$(sse_events "$HTTP_BODY")
 echo "$ev16" | tail -1 | python3 -c '
 import json, sys
 line = sys.stdin.read().split("\t", 1)
 event = line[0]
 data = json.loads(line[1])
-assert event in ("final", "error"), f"终态异常: {event}"
-if event == "final":
-    assert data.get("answer_source") != "faq_cache", "外部命中了内部 FAQ（越权）！"
+assert event == "final", f"终态异常: {event}"
+assert data.get("answer_source") != "faq_cache", "外部命中了内部 FAQ（越权）！"
 ' || fail "外部疑似命中 internal 范围"
 pass "外部未命中 internal/admin 范围"
 

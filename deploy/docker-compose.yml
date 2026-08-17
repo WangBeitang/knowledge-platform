@@ -12,7 +12,7 @@
 # MySQL 应用账号（冻结，Batch 2）：
 # - 平台 backend 使用独立应用账号（MYSQL_APP_USER / MYSQL_APP_PASSWORD），
 #   禁止使用 root；root 密码仅用于容器初始化/运维，不进入 backend 运行配置；
-# - 首次启动由 /docker-entrypoint-initdb.d/01-app-user.sql 创建应用账号并授权。
+# - 首次启动由 /docker-entrypoint-initdb.d/01-app-user.sh 创建应用账号并授权。
 services:
   mysql:
     image: mysql:8.4
@@ -20,6 +20,9 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: knowledge_platform
+      # 显式注入应用账号变量：01-app-user.sh 初始化脚本依赖容器内这两个变量
+      MYSQL_APP_USER: ${MYSQL_APP_USER}
+      MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD}
       TZ: Asia/Shanghai
     command:
       - --character-set-server=utf8mb4
