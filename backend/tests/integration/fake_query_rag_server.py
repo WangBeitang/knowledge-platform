@@ -35,6 +35,11 @@ class FakeQueryRag:
         self.stream_delay: float = 0.0
         self.fail_submit: str | None = None  # "unavailable" | "timeout" | "bad"
         self.drop_stream: bool = False  # 流结束但无终态
+        self.stream_network_error: bool = False  # 流式连接抛网络错误（模拟 socket 断流）
+        self.submit_session_id_override: str | None = (
+            None  # 契约错误：返回与请求不一致的 session_id
+        )
+        self.status_calls: list[str] = []  # 记录 /status 触达的 session_id（含重试）
 
     # ---------- 测试控制 ----------
 
@@ -101,21 +106,23 @@ class FakeQueryRag:
             return httpx.Response(504, json={"detail": "upstream timeout"})
         if self.fail_submit == "bad":
             return httpx.Response(200, content=b"<html>not json</html>")
+        returned_session_id = self.submit_session_id_override or body.get("session_id")
         return httpx.Response(
-            200, json={"message": "查询任务已开始", "session_id": body.get("session_id")}
+            200, json={"message": "查询任务已开始", "session_id": returned_session_id}
         )
 
     async def _handle_stream(self, session_id: str) -> httpx.Response:
+        if self.stream_network_error:
+            # 模拟流式 socket 断开（连接层异常，不是 HTTP 状态码）
+            raise httpx.ConnectError("simulated stream socket error", request=None)
         if self.stream_delay > 0:
             await asyncio.sleep(self.stream_delay)
         events = self.streams.get(session_id, [])
         body = "".join(_sse_pack(event, data) for event, data in events)
-        if self.drop_stream:
-            # 模拟无终态断开：直接结束流（没有 final/error）
-            return httpx.Response(200, content=body, headers=SSE_HEADERS)
         return httpx.Response(200, content=body, headers=SSE_HEADERS)
 
     def _handle_status(self, session_id: str) -> httpx.Response:
+        self.status_calls.append(session_id)
         status = self.statuses.get(session_id)
         if status is None:
             return httpx.Response(404, json={"detail": f"session {session_id} 不存在"})

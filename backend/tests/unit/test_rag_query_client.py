@@ -179,3 +179,106 @@ async def test_get_status_unknown_status_is_bad_response(fake):
         assert exc_info.value.code == "RAG_BAD_RESPONSE"
     finally:
         await c.aclose()
+
+
+class TestContractTightening:
+    """首轮复核决策 4：Adapter 契约校验收紧。"""
+
+    @pytest.mark.asyncio
+    async def test_submit_mismatched_session_id_is_bad_response(self, fake):
+        fake.submit_session_id_override = "other-session"
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.submit_query(
+                    query="q", session_id="request-session", dataset_ids=["d"], service_user="u"
+                )
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_status_done_list_not_list_of_str_is_bad_response(self, fake):
+        fake.seed_status("s1", {"status": "completed", "done_list": "bad", "running_list": []})
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_status_running_list_not_list_of_str_is_bad_response(self, fake):
+        fake.seed_status("s1", {"status": "processing", "done_list": [], "running_list": [123]})
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_stream_delta_not_str_is_bad_response(self, fake):
+        fake.seed_stream("s1", [("ready", {}), ("delta", {"delta": 123})])
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                events = [item async for item in c.stream_events("s1", service_user="u")]
+                _ = events
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_stream_final_missing_trace_id_is_bad_response(self, fake):
+        fake.seed_stream(
+            "s1",
+            [("final", {"answer": "a", "citations": [], "terminal_reason_code": "completed"})],
+        )
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                events = [item async for item in c.stream_events("s1", service_user="u")]
+                _ = events
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_stream_final_citations_not_list_is_bad_response(self, fake):
+        fake.seed_stream(
+            "s1",
+            [
+                (
+                    "final",
+                    {
+                        "answer": "a",
+                        "trace_id": "t",
+                        "citations": "bad",
+                        "terminal_reason_code": "c",
+                    },
+                )
+            ],
+        )
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                events = [item async for item in c.stream_events("s1", service_user="u")]
+                _ = events
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_stream_final_missing_terminal_reason_is_bad_response(self, fake):
+        fake.seed_stream("s1", [("final", {"answer": "a", "trace_id": "t", "citations": []})])
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                events = [item async for item in c.stream_events("s1", service_user="u")]
+                _ = events
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()

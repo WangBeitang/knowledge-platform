@@ -465,18 +465,9 @@ class TestRagStream:
         messages = await _messages_of(db_session, session_id)
         assert messages[1].status == "failed"
 
-    async def test_browser_disconnect_not_marked_failed(
-        self, client, db_session, tracked_users, chat_rag_factory
-    ):
-        """浏览器断开 ≠ RAG 失败：不能仅因客户端断开把业务 Turn 标为 failed。"""
-        fake = chat_rag_factory(FakeQueryRag(), db_session)
-        _, token = await _make_employee(db_session, tracked_users, client)
-        session_id = await _create_session(client, token)
-        fake.seed_stream(session_id, _rag_stream_events())
+    async def _disconnect_first_turn(self, client, token, session_id, fake) -> None:
+        """发一问后客户端立即断开（上游仍在跑），返回后平台侧 orphaned 保留。"""
         fake.stream_delay = 5.0  # 上游迟迟不返回，客户端先断开
-
-        # 用 stream 模式读取一行后提前关闭，模拟浏览器断开（不用 task.cancel，
-        # 避免强杀请求导致 DB 连接中途取消）
         async with client.stream(
             "POST",
             SSE_STREAM_PATH.format(sid=session_id),
@@ -486,9 +477,23 @@ class TestRagStream:
             assert resp.status_code == 200
             async for _ in resp.aiter_lines():
                 break  # 读一行（ready）后立即断开
-        await asyncio.sleep(0.6)  # 等平台侧释放占位
+        fake.stream_delay = 0.0
+        await asyncio.sleep(0.6)  # 等平台侧 generator finally 执行完毕
 
-        # 没有终态落库 → 不能出现 status=failed 的日志（断开不等于 RAG failed）
+    async def test_browser_disconnect_not_marked_failed(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """浏览器断开 ≠ RAG 失败：不能仅因客户端断开把业务 Turn 标为 failed。
+
+        真实 uvicorn 断开会取消响应任务（不落库）；ASGITransport 下 generator 可能
+        继续跑完（落 succeeded 终态）。两种行为都允许，唯一硬约束：不得出现 failed。
+        """
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_stream(session_id, _rag_stream_events())
+        await self._disconnect_first_turn(client, token, session_id, fake)
+
         logs = list(
             (
                 await db_session.scalars(
@@ -497,16 +502,125 @@ class TestRagStream:
             ).all()
         )
         assert all(log.status != "failed" for log in logs)
-        # 断开后占位已释放：可以再次发问
-        fake.stream_delay = 0.0
-        fake.seed_stream(session_id, _rag_stream_events())
-        resp = await client.post(
-            SSE_STREAM_PATH.format(sid=session_id),
-            headers=await bearer_headers(token),
-            json={"question": "重新提问"},
+
+    async def test_orphaned_processing_second_ask_409(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """孤儿 Turn（已 submit、未确认 terminal）上游仍 processing → 第二问 409。
+
+        直接向进程内 registry 构造 orphaned 状态，稳定验证 recover 判定逻辑
+        （不依赖 ASGITransport 的断开语义）。
+        """
+        from app.services.chat_service import TurnRecord, _active_turns
+
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_status(
+            session_id,
+            {"status": "processing", "done_list": [], "running_list": ["node_rerank"]},
         )
-        assert resp.status_code == 200
-        assert parse_sse(resp.text)[-1][0] == "final"
+        user_id = tracked_users[-1]
+        orphan = TurnRecord(
+            session_id=session_id,
+            user_id=user_id,
+            turn_id="orphan-turn-1",
+            question="旧问题",
+            normalized="旧问题",
+            question_hash="h" * 64,
+            scopes=["internal_shared", "external_public"],
+            started_at=0.0,
+            submitted=True,
+            rag_service_user="svc_knowledge_employee",
+        )
+        assert await _active_turns.try_acquire(session_id, orphan)
+        try:
+            resp = await client.post(
+                SSE_STREAM_PATH.format(sid=session_id),
+                headers=await bearer_headers(token),
+                json={"question": "第二问"},
+            )
+            assert resp.status_code == 409
+            assert resp.json()["error"]["code"] == "RESOURCE_CONFLICT"
+            assert len(fake.query_calls) == 0  # 未提交新 /query（不重叠）
+        finally:
+            await _active_turns.release(session_id)
+
+    async def test_orphaned_terminal_second_ask_recovers_and_succeeds(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """孤儿 Turn 上游已 completed → 清理旧状态、补齐旧 Turn 终态，第二问成功。"""
+        from app.services.chat_service import TurnRecord, _active_turns
+
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        user_id, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_status(
+            session_id,
+            {
+                "status": "completed",
+                "done_list": ["node_answer_output"],
+                "running_list": [],
+                "answer": "断开期间上游完成的答案",
+                "error": "",
+                "image_urls": [],
+                "trace_id": "trace-recovered",
+                "citations": [LOCAL_CITATION],
+                "terminal_reason_code": "completed",
+            },
+        )
+        orphan = TurnRecord(
+            session_id=session_id,
+            user_id=user_id,
+            turn_id="orphan-turn-2",
+            question="旧问题",
+            normalized="旧问题",
+            question_hash="h" * 64,
+            scopes=["internal_shared", "external_public"],
+            started_at=0.0,
+            submitted=True,
+            rag_service_user="svc_knowledge_employee",
+        )
+        assert await _active_turns.try_acquire(session_id, orphan)
+        try:
+            # 第二问：recover 先补齐旧 Turn（2 条消息 + 1 条日志），再执行新 Query
+            fake.seed_stream(session_id, _rag_stream_events())
+            resp = await client.post(
+                SSE_STREAM_PATH.format(sid=session_id),
+                headers=await bearer_headers(token),
+                json={"question": "第二问"},
+            )
+            assert resp.status_code == 200
+            events = parse_sse(resp.text)
+            assert events[-1][0] == "final"
+            assert events[-1][1]["answer_source"] == "rag"
+
+            messages = await _messages_of(db_session, session_id)
+            # 旧 Turn（user+assistant，assistant=上游终态答案）+ 新 Turn（user+assistant）
+            assert len(messages) == 4
+            assert messages[1].content == "断开期间上游完成的答案"
+            assert messages[1].status == "completed"
+            assert messages[1].rag_trace_id == "trace-recovered"
+            assert messages[1].citations_json[0]["document_id"] == "doc-1"
+            # 旧 Turn 的 delta/final 不进入新 Query：第二问 assistant 是新 final 答案
+            assert messages[3].content == "办理风险测评请通过柜台或 App 完成。"
+            seqs = [m.seq_no for m in messages]
+            assert seqs == [1, 2, 3, 4]
+
+            logs = list(
+                (
+                    await db_session.scalars(
+                        select(QaAccessLog).where(QaAccessLog.session_id == session_id)
+                    )
+                ).all()
+            )
+            assert len(logs) == 2  # 每 Turn 恰好一条
+            recovered_log = next(log for log in logs if log.rag_trace_id == "trace-recovered")
+            assert recovered_log.status == "succeeded"
+            assert recovered_log.answer_source == "rag"
+            assert recovered_log.citation_count == 1
+        finally:
+            await _active_turns.release(session_id)
 
     async def test_error_terminal_no_extra_events(
         self, client, db_session, tracked_users, chat_rag_factory
@@ -551,3 +665,169 @@ def json_dumps(obj) -> str:
 
 async def bearer_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+class TestStreamFallbackAndContract:
+    async def test_stream_socket_error_status_completed_yields_final(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """stream socket 报错，但 /status 已 completed → 仍以 final 成功收口（决策 3）。"""
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_stream(session_id, [("ready", {}), ("delta", {"delta": "部"})])
+        fake.stream_network_error = True  # 流式连接层抛错
+        fake.seed_status(
+            session_id,
+            {
+                "status": "completed",
+                "done_list": ["node_answer_output"],
+                "running_list": [],
+                "answer": "网络断流但上游已完成",
+                "error": "",
+                "image_urls": [],
+                "trace_id": "trace-socket-fallback",
+                "citations": [LOCAL_CITATION],
+                "terminal_reason_code": "completed",
+            },
+        )
+        resp = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "如何办理风险测评？"},
+        )
+        assert resp.status_code == 200
+        events = parse_sse(resp.text)
+        names = [name for name, _ in events]
+        assert names[-1] == "final"
+        assert "error" not in names
+        final = events[-1][1]
+        assert final["answer"] == "网络断流但上游已完成"
+        assert final["trace_id"] == "trace-socket-fallback"
+        assert final["answer_source"] == "rag"
+        messages = await _messages_of(db_session, session_id)
+        assert messages[1].status == "completed"
+        assert messages[1].content == "网络断流但上游已完成"
+
+    async def test_stream_socket_error_status_processing_yields_error(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """stream socket 报错且 /status 仍 processing → 稳定 error，绝不伪成功。"""
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_stream(session_id, [("ready", {})])
+        fake.stream_network_error = True
+        fake.seed_status(
+            session_id,
+            {"status": "processing", "done_list": [], "running_list": ["node_rerank"]},
+        )
+        resp = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "如何办理风险测评？"},
+        )
+        assert resp.status_code == 200
+        events = parse_sse(resp.text)
+        names = [name for name, _ in events]
+        assert names[-1] == "error"
+        assert "final" not in names
+        assert events[-1][1]["code"] == "RAG_UNAVAILABLE"  # 连接层错误 → RAG_UNAVAILABLE
+        messages = await _messages_of(db_session, session_id)
+        assert messages[1].status == "failed"
+
+    async def test_malformed_final_missing_trace_id_yields_error(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """malformed final（缺 trace_id）→ 平台结构化 SSE error，连接不截断。"""
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_stream(
+            session_id,
+            [
+                ("ready", {}),
+                ("delta", {"delta": "部"}),
+                (
+                    "final",
+                    {"answer": "缺 trace_id", "citations": [], "terminal_reason_code": "completed"},
+                ),
+            ],
+        )
+        resp = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "如何办理风险测评？"},
+        )
+        assert resp.status_code == 200
+        events = parse_sse(resp.text)
+        names = [name for name, _ in events]
+        assert names[-1] == "error"
+        assert "final" not in names
+        assert events[-1][1]["code"] == "RAG_BAD_RESPONSE"
+        messages = await _messages_of(db_session, session_id)
+        assert messages[1].status == "failed"
+        assert messages[1].error_code == "RAG_BAD_RESPONSE"
+
+    async def test_malformed_final_citations_not_list_yields_error(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_stream(
+            session_id,
+            [
+                ("ready", {}),
+                (
+                    "final",
+                    {
+                        "answer": "a",
+                        "trace_id": "t-1",
+                        "citations": {"bad": 1},
+                        "terminal_reason_code": "completed",
+                    },
+                ),
+            ],
+        )
+        resp = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "如何办理风险测评？"},
+        )
+        assert resp.status_code == 200
+        events = parse_sse(resp.text)
+        assert events[-1][0] == "error"
+        assert events[-1][1]["code"] == "RAG_BAD_RESPONSE"
+
+    async def test_malformed_status_done_list_yields_error(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """断流后 /status.done_list 非 list[str] → 契约错误 → error（不伪成功）。"""
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_stream(session_id, [("ready", {})])
+        fake.seed_status(
+            session_id,
+            {
+                "status": "completed",
+                "done_list": "bad",
+                "running_list": [],
+                "answer": "a",
+                "trace_id": "t",
+            },
+        )
+        resp = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "如何办理风险测评？"},
+        )
+        assert resp.status_code == 200
+        events = parse_sse(resp.text)
+        names = [name for name, _ in events]
+        assert names[-1] == "error"
+        assert "final" not in names
+        assert events[-1][1]["code"] == "RAG_BAD_RESPONSE"
+        messages = await _messages_of(db_session, session_id)
+        assert messages[1].status == "failed"

@@ -129,6 +129,8 @@ class RagQueryClient:
         upstream_session_id = str(payload.get("session_id") or "").strip()
         if not upstream_session_id:
             raise rag_bad_response("上游查询提交响应缺少 session_id")
+        if upstream_session_id != session_id:
+            raise rag_bad_response("上游查询提交返回的 session_id 与请求不一致")
         return upstream_session_id
 
     # ---------- GET /status（网络错误重试）----------
@@ -166,15 +168,30 @@ class RagQueryClient:
             raise rag_bad_response("上游状态响应缺少 status")
         if status not in KNOWN_TASK_STATUSES:
             raise rag_bad_response(f"上游状态未知: {status}")
+        done_list = payload.get("done_list") or []
+        running_list = payload.get("running_list") or []
+        if not isinstance(done_list, list) or not all(isinstance(v, str) for v in done_list):
+            raise rag_bad_response("上游状态 done_list 结构异常")
+        if not isinstance(running_list, list) or not all(isinstance(v, str) for v in running_list):
+            raise rag_bad_response("上游状态 running_list 结构异常")
+        answer = payload.get("answer")
+        if not isinstance(answer, str):
+            raise rag_bad_response("上游状态 answer 类型异常")
+        error = payload.get("error")
+        if not isinstance(error, str):
+            raise rag_bad_response("上游状态 error 类型异常")
+        citations = payload.get("citations") or []
+        if not isinstance(citations, list) or not all(isinstance(c, dict) for c in citations):
+            raise rag_bad_response("上游状态 citations 结构异常")
         return RagQueryStatus(
             status=status,
-            done_list=list(payload.get("done_list") or []),
-            running_list=list(payload.get("running_list") or []),
-            answer=str(payload.get("answer") or ""),
-            error=str(payload.get("error") or ""),
+            done_list=done_list,
+            running_list=running_list,
+            answer=answer,
+            error=error,
             image_urls=list(payload.get("image_urls") or []),
             trace_id=str(payload.get("trace_id") or ""),
-            citations=list(payload.get("citations") or []),
+            citations=citations,
             terminal_reason_code=(
                 str(payload["terminal_reason_code"])
                 if payload.get("terminal_reason_code") is not None
@@ -214,7 +231,7 @@ class RagQueryClient:
                     stripped = line.strip()
                     if not stripped:
                         if event is not None or data_lines:
-                            yield self._parse_event(event, data_lines)
+                            yield self._parse_and_validate_event(event, data_lines)
                             event = None
                             data_lines = []
                         continue
@@ -224,12 +241,19 @@ class RagQueryClient:
                         data_lines.append(stripped[len("data:") :].strip())
                 # 流结束但事件未闭合：尽力解析，不静默丢弃
                 if event is not None or data_lines:
-                    yield self._parse_event(event, data_lines)
+                    yield self._parse_and_validate_event(event, data_lines)
         except httpx.HTTPError as exc:
             raise map_http_error(exc) from exc
 
     @staticmethod
-    def _parse_event(event: str | None, data_lines: list[str]) -> tuple[str, dict[str, Any]]:
+    def _parse_and_validate_event(
+        event: str | None, data_lines: list[str]
+    ) -> tuple[str, dict[str, Any]]:
+        """解析单个 SSE 事件并做上游契约校验（delta/final 字段）。
+
+        任何契约异常统一抛 RAG_BAD_RESPONSE，由服务层走稳定 error / status 兜底，
+        绝不让 AttributeError/TypeError 直接截断下游连接。
+        """
         event_name = event or "message"
         raw = "\n".join(data_lines).strip()
         if not raw:
@@ -240,6 +264,26 @@ class RagQueryClient:
             raise rag_bad_response("上游 SSE data 不是合法 JSON") from exc
         if not isinstance(data, dict):
             raise rag_bad_response("上游 SSE data 不是 JSON 对象")
+
+        if event_name == "delta":
+            delta = data.get("delta")
+            if not isinstance(delta, str):
+                raise rag_bad_response("上游 delta 事件缺少 delta 字符串")
+        elif event_name == "final":
+            answer = data.get("answer")
+            if not isinstance(answer, str):
+                raise rag_bad_response("上游 final 缺少 answer")
+            trace_id = data.get("trace_id")
+            if not isinstance(trace_id, str) or not trace_id.strip():
+                raise rag_bad_response("上游 final 缺少 trace_id")
+            citations = data.get("citations")
+            if not isinstance(citations, list) or not all(isinstance(c, dict) for c in citations):
+                raise rag_bad_response("上游 final citations 结构异常")
+            if "terminal_reason_code" not in data:
+                raise rag_bad_response("上游 final 缺少 terminal_reason_code")
+            terminal_reason = data.get("terminal_reason_code")
+            if terminal_reason is not None and not isinstance(terminal_reason, str):
+                raise rag_bad_response("上游 final terminal_reason_code 类型异常")
         return event_name, data
 
 

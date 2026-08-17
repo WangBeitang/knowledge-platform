@@ -4,6 +4,7 @@ from datetime import datetime
 
 from sqlalchemy import select, update
 
+from app.core.time import utc_now_naive
 from app.models.chat_session import ChatSession
 from app.repositories.base import BaseRepository
 
@@ -87,7 +88,7 @@ class ChatSessionRepository(BaseRepository[ChatSession]):
             session.title = title
         if status is not None:
             session.status = status
-        session.updated_at = datetime.now()
+        session.updated_at = utc_now_naive()
         await self.session.flush()
 
     async def soft_delete(

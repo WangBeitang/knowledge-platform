@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
 from app.core.errors import bad_request, conflict
-from app.core.normalizer import normalize_question
+from app.core.normalizer import normalize_question, question_hash
 from app.core.request_context import get_request_id
 from app.core.time import iso8601
 from app.models.chat_message import ChatMessage
@@ -24,6 +24,7 @@ from app.models.chat_session import ChatSession
 from app.models.user import User
 from app.rag.rag_query_client import get_rag_query_client
 from app.rag.rag_trace_client import get_rag_trace_client
+from app.rag.scope_policy import scopes_for_role
 from app.repositories.audit_log_repository import AuditLogRepository
 from app.repositories.chat_message_repository import ChatMessageRepository
 from app.repositories.chat_session_repository import ChatSessionRepository
@@ -191,11 +192,23 @@ async def stream_message(
     normalized = normalize_question(payload.question)
     if not normalized:
         raise bad_request("问题不能为空", code=EMPTY_QUESTION_CODE)
+    # 上一轮断开但上游可能仍在运行：先 GET /status 判定旧状态，
+    # 只有旧任务已 terminal（或可清理）才允许提交新 Query（409 保守拒绝重叠）。
+    await service.recover_orphaned(session_id, user.id)
     # 后端并发校验：同 session 同一时间只能有一个进行中的问答（409）
-    if not await service.try_acquire_turn(session_id):
+    started_at = time.perf_counter()
+    record = service.build_turn_record(
+        user=user,
+        session_id=session_id,
+        question=payload.question,
+        normalized=normalized,
+        question_hash_value=question_hash(normalized),
+        scopes=scopes_for_role(user.role),
+        started_at=started_at,
+    )
+    if not await service.try_acquire_turn(session_id, record):
         raise conflict("该会话正在回答中，请稍后再试")
     request_id = get_request_id()
-    started_at = time.perf_counter()
 
     async def generate():
         try:
@@ -207,11 +220,13 @@ async def stream_message(
                 request_id=request_id,
                 background_tasks=background_tasks,
                 started_at=started_at,
+                record=record,
             ):
                 yield chunk
         finally:
-            # 无论终态、异常还是客户端断开，都必须释放并发占位
-            await service.release_turn(session_id)
+            # 正常终态（final/error 已产出）→ 释放；
+            # 客户端断开/异常 → 保留 orphaned，下次触达先查上游 /status 再决定
+            await service.maybe_release_turn(session_id)
 
     return StreamingResponse(
         generate(),
