@@ -1,5 +1,18 @@
-# 单机部署（阶段 6 在目标云服务器执行）。
-# 环境变量：本文件同目录的 .env 提供 MYSQL_ROOT_PASSWORD / REDIS_PASSWORD 等。
+# 单机部署（Stage 6 在目标云服务器执行）。
+#
+# 网络暴露策略（冻结，Stage 6 Batch 2）：
+# - MySQL / Redis 只在 Docker 内部网络使用，**不发布任何宿主端口**；
+# - backend 仅绑定 127.0.0.1:8000（宿主机调试/初始化用，不对公网监听）；
+# - frontend 仅绑定 127.0.0.1:8080（宿主 Nginx 反代入口）；
+# - 公网入口统一由宿主 Nginx 的 80/443 提供（deploy/nginx/conf.d/platform.conf）。
+#
+# 环境变量：本文件同目录的 .env 提供（参考 deploy/.env.example）：
+#   MYSQL_ROOT_PASSWORD / MYSQL_APP_USER / MYSQL_APP_PASSWORD / REDIS_PASSWORD
+#
+# MySQL 应用账号（冻结，Batch 2）：
+# - 平台 backend 使用独立应用账号（MYSQL_APP_USER / MYSQL_APP_PASSWORD），
+#   禁止使用 root；root 密码仅用于容器初始化/运维，不进入 backend 运行配置；
+# - 首次启动由 /docker-entrypoint-initdb.d/01-app-user.sql 创建应用账号并授权。
 services:
   mysql:
     image: mysql:8.4
@@ -13,8 +26,8 @@ services:
       - --collation-server=utf8mb4_unicode_ci
     volumes:
       - mysql_data:/var/lib/mysql
-    ports:
-      - "3306:3306"
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    # 不发布宿主端口：仅容器内部网络可达（backend 通过服务名 mysql:3306）
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
@@ -28,8 +41,7 @@ services:
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
-    ports:
-      - "6379:6379"
+    # 不发布宿主端口：仅容器内部网络可达
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
@@ -45,15 +57,23 @@ services:
       # 容器内网用服务名互连，覆盖 .env 中的回环/公网地址
       DB_HOST: mysql
       DB_PORT: "3306"
+      DB_USER: ${MYSQL_APP_USER}
+      DB_PASSWORD: ${MYSQL_APP_PASSWORD}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+    extra_hosts:
+      # 原 RAG 若运行在宿主进程：backend 容器内用 host.docker.internal 访问，
+      # 不直接使用 127.0.0.1（容器内 127.0.0.1 指容器自身）。
+      # backend/.env 中 RAG_QUERY_BASE_URL=http://host.docker.internal:<query_port>
+      #                   RAG_IMPORT_BASE_URL=http://host.docker.internal:<import_port>
+      - "host.docker.internal:host-gateway"
     depends_on:
       mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"   # 仅回环：宿主机初始化/调试用，不对公网监听
     restart: unless-stopped
 
   frontend:
@@ -62,7 +82,7 @@ services:
     depends_on:
       - backend
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"     # 仅回环：宿主 Nginx 反代入口，不对公网监听
     restart: unless-stopped
 
 volumes:
