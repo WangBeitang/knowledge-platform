@@ -11,6 +11,7 @@ import {
   QuestionFilled,
   UploadFilled,
   User,
+  Warning,
 } from '@element-plus/icons-vue'
 
 import { useAuthStore } from '@/stores/auth'
@@ -29,6 +30,7 @@ const adminMenu = [
   { path: '/admin/faq-candidates', label: 'FAQ 候选', icon: QuestionFilled },
   { path: '/admin/faqs', label: 'FAQ 管理', icon: Collection },
   { path: '/admin/faq-sync-runs', label: 'FAQ 同步', icon: Clock },
+  { path: '/admin/knowledge-gaps', label: '知识缺口', icon: Warning },
   { path: '/admin/integration', label: '系统集成', icon: Connection },
 ]
 

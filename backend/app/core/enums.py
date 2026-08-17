@@ -133,6 +133,9 @@ class AuditAction(StrEnum):
     faq_unpublished = "faq_unpublished"
     faq_republished = "faq_republished"
     faq_sync_retried = "faq_sync_retried"
+    # Stage 5：知识缺口处理
+    gap_ignored = "gap_ignored"
+    gap_resolved = "gap_resolved"
 
 
 class AuditResult(StrEnum):

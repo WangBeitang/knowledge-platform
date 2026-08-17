@@ -75,6 +75,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: 'FAQ 同步状态', adminOnly: true },
       },
       {
+        path: 'admin/knowledge-gaps',
+        name: 'admin-knowledge-gaps',
+        component: () => import('@/views/admin/KnowledgeGapsView.vue'),
+        meta: { title: '知识缺口', adminOnly: true },
+      },
+      {
         path: 'home',
         name: 'home',
         component: () => import('@/views/employee/HomeView.vue'),

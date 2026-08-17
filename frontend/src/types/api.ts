@@ -335,3 +335,31 @@ export interface FaqAnalyzeData {
   updated: number
   skipped_published: number
 }
+
+// ========== Stage 5 Batch 2：知识缺口 ==========
+
+export type GapStatus = 'pending_review' | 'ignored' | 'resolved'
+
+export type GapReasonCode = 'no_citation' | 'insufficient_evidence'
+
+export interface GapView {
+  id: string
+  knowledge_scope: KnowledgeScope
+  normalized_question: string
+  normalized_question_hash: string
+  sample_questions: string[]
+  ask_count: number
+  reason_code: GapReasonCode
+  status: GapStatus
+  resolution_note: string | null
+  resolved_document_id: string | null
+  reviewed_by_user_id: string | null
+  created_at: string | null
+  last_seen_at: string | null
+  reviewed_at: string | null
+}
+
+export interface GapAnalyzeData {
+  created: number
+  updated: number
+}

@@ -12,6 +12,7 @@ from app.api.v1 import (
     faqs,
     health,
     integration,
+    knowledge_gaps,
     users,
 )
 
@@ -26,3 +27,4 @@ router.include_router(chat.router)
 router.include_router(faq_candidates.router)
 router.include_router(faqs.router)
 router.include_router(faq_sync_runs.router)
+router.include_router(knowledge_gaps.router)
