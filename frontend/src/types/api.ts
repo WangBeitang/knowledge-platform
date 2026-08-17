@@ -158,6 +158,11 @@ export interface ReplaceData {
   status: string
 }
 
+export interface DeleteData {
+  id: string
+  platform_status: string
+}
+
 export interface ChunkView {
   chunk_id: string
   document_id: string

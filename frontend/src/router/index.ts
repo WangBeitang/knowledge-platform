@@ -39,6 +39,24 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '系统集成', adminOnly: true },
       },
       {
+        path: 'admin/knowledge-import',
+        name: 'admin-knowledge-import',
+        component: () => import('@/views/admin/KnowledgeImportView.vue'),
+        meta: { title: '知识导入', adminOnly: true },
+      },
+      {
+        path: 'admin/documents',
+        name: 'admin-documents',
+        component: () => import('@/views/admin/DocumentListView.vue'),
+        meta: { title: '文档管理', adminOnly: true },
+      },
+      {
+        path: 'admin/documents/:id',
+        name: 'admin-document-detail',
+        component: () => import('@/views/admin/DocumentDetailView.vue'),
+        meta: { title: '文档详情', adminOnly: true },
+      },
+      {
         path: 'home',
         name: 'home',
         component: () => import('@/views/employee/HomeView.vue'),

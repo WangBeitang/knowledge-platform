@@ -140,46 +140,151 @@ onMounted(fetchDocuments)
         <div class="toolbar">
           <span class="card-title">文档管理</span>
           <div class="filters">
-            <el-select v-model="filters.knowledge_scope" placeholder="知识范围" clearable style="width: 140px" @change="fetchDocuments">
-              <el-option label="外部公开" value="external_public" />
-              <el-option label="内部共享" value="internal_shared" />
-              <el-option label="管理员专属" value="admin_private" />
+            <el-select
+              v-model="filters.knowledge_scope"
+              placeholder="知识范围"
+              clearable
+              style="width: 140px"
+              @change="fetchDocuments"
+            >
+              <el-option
+                label="外部公开"
+                value="external_public"
+              />
+              <el-option
+                label="内部共享"
+                value="internal_shared"
+              />
+              <el-option
+                label="管理员专属"
+                value="admin_private"
+              />
             </el-select>
-            <el-select v-model="filters.platform_status" placeholder="平台状态" clearable style="width: 130px" @change="fetchDocuments">
-              <el-option label="导入中" value="importing" />
-              <el-option label="正常" value="active" />
-              <el-option label="导入失败" value="import_failed" />
-              <el-option label="已替换" value="replaced" />
-              <el-option label="已删除" value="deleted" />
+            <el-select
+              v-model="filters.platform_status"
+              placeholder="平台状态"
+              clearable
+              style="width: 130px"
+              @change="fetchDocuments"
+            >
+              <el-option
+                label="导入中"
+                value="importing"
+              />
+              <el-option
+                label="正常"
+                value="active"
+              />
+              <el-option
+                label="导入失败"
+                value="import_failed"
+              />
+              <el-option
+                label="已替换"
+                value="replaced"
+              />
+              <el-option
+                label="已删除"
+                value="deleted"
+              />
             </el-select>
-            <el-input v-model="filters.file_name" placeholder="文件名" clearable style="width: 160px" @keyup.enter="fetchDocuments" @clear="fetchDocuments" />
-            <el-button type="primary" @click="fetchDocuments">查询</el-button>
+            <el-input
+              v-model="filters.file_name"
+              placeholder="文件名"
+              clearable
+              style="width: 160px"
+              @keyup.enter="fetchDocuments"
+              @clear="fetchDocuments"
+            />
+            <el-button
+              type="primary"
+              @click="fetchDocuments"
+            >
+              查询
+            </el-button>
           </div>
         </div>
       </template>
 
-      <el-table v-loading="loading" :data="items" border stripe>
-        <el-table-column prop="file_name" label="文件名" min-width="180" show-overflow-tooltip />
-        <el-table-column label="知识范围" width="110">
-          <template #default="{ row }"><ScopeTag :scope="row.knowledge_scope" /></template>
-        </el-table-column>
-        <el-table-column label="来源" width="110">
-          <template #default="{ row }">{{ row.source_kind === 'manual_upload' ? '手动上传' : row.source_kind }}</template>
-        </el-table-column>
-        <el-table-column label="平台状态" width="100">
+      <el-table
+        v-loading="loading"
+        :data="items"
+        border
+        stripe
+      >
+        <el-table-column
+          prop="file_name"
+          label="文件名"
+          min-width="180"
+          show-overflow-tooltip
+        />
+        <el-table-column
+          label="知识范围"
+          width="110"
+        >
           <template #default="{ row }">
-            <el-tag :type="statusType(row.platform_status)" size="small" effect="plain">{{ statusText(row.platform_status) }}</el-tag>
+            <ScopeTag :scope="row.knowledge_scope" />
           </template>
         </el-table-column>
-        <el-table-column prop="rag_status" label="RAG 状态" width="110" />
-        <el-table-column prop="chunk_count" label="Chunk 数" width="90" />
-        <el-table-column prop="index_version" label="索引版本" width="90" />
-        <el-table-column label="更新时间" width="170">
-          <template #default="{ row }">{{ formatDateTime(row.updated_at) }}</template>
-        </el-table-column>
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column
+          label="来源"
+          width="110"
+        >
           <template #default="{ row }">
-            <el-button link type="primary" size="small" @click="openDetail(row)">详情</el-button>
+            {{ row.source_kind === 'manual_upload' ? '手动上传' : row.source_kind }}
+          </template>
+        </el-table-column>
+        <el-table-column
+          label="平台状态"
+          width="100"
+        >
+          <template #default="{ row }">
+            <el-tag
+              :type="statusType(row.platform_status)"
+              size="small"
+              effect="plain"
+            >
+              {{ statusText(row.platform_status) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="rag_status"
+          label="RAG 状态"
+          width="110"
+        />
+        <el-table-column
+          prop="chunk_count"
+          label="Chunk 数"
+          width="90"
+        />
+        <el-table-column
+          prop="index_version"
+          label="索引版本"
+          width="90"
+        />
+        <el-table-column
+          label="更新时间"
+          width="170"
+        >
+          <template #default="{ row }">
+            {{ formatDateTime(row.updated_at) }}
+          </template>
+        </el-table-column>
+        <el-table-column
+          label="操作"
+          width="220"
+          fixed="right"
+        >
+          <template #default="{ row }">
+            <el-button
+              link
+              type="primary"
+              size="small"
+              @click="openDetail(row)"
+            >
+              详情
+            </el-button>
             <el-button
               v-if="['active', 'import_failed'].includes(row.platform_status)"
               link

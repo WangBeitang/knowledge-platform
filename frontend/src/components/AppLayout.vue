@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { Connection, Document, HomeFilled, UploadFilled, User } from '@element-plus/icons-vue'
 
 import { useAuthStore } from '@/stores/auth'
 
@@ -12,8 +13,10 @@ const isAdmin = computed(() => auth.user?.role === 'admin')
 const displayName = computed(() => auth.user?.display_name || auth.user?.username || '--')
 
 const adminMenu = [
-  { path: '/admin/users', label: '员工账号', icon: 'User' },
-  { path: '/admin/integration', label: '系统集成', icon: 'Connection' },
+  { path: '/admin/users', label: '员工账号', icon: User },
+  { path: '/admin/knowledge-import', label: '知识导入', icon: UploadFilled },
+  { path: '/admin/documents', label: '文档管理', icon: Document },
+  { path: '/admin/integration', label: '系统集成', icon: Connection },
 ]
 
 async function handleLogout(): Promise<void> {

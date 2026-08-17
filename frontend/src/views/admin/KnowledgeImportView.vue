@@ -2,7 +2,7 @@
 import { onBeforeUnmount, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
-import type { UploadFile } from 'element-plus'
+import type { UploadFile, UploadRawFile } from 'element-plus'
 
 import { ApiError } from '@/api/client'
 import * as documentsApi from '@/api/documents'
@@ -20,7 +20,7 @@ const pollingTaskIds = new Set<string>()
 function onFileChange(uploadFiles: UploadFile[]): void {
   selectedFiles.value = uploadFiles
     .map((f) => f.raw)
-    .filter((raw): raw is File => raw !== undefined)
+    .filter((raw): raw is UploadRawFile => raw !== undefined)
 }
 
 async function handleImport(): Promise<void> {
@@ -89,7 +89,10 @@ onBeforeUnmount(stopPolling)
 
 <template>
   <div class="knowledge-import">
-    <el-card shadow="never" class="import-card">
+    <el-card
+      shadow="never"
+      class="import-card"
+    >
       <template #header>
         <span class="card-title">知识导入</span>
       </template>
@@ -97,9 +100,15 @@ onBeforeUnmount(stopPolling)
       <el-form label-position="top">
         <el-form-item label="知识范围">
           <el-radio-group v-model="scope">
-            <el-radio value="external_public">外部公开</el-radio>
-            <el-radio value="internal_shared">内部共享</el-radio>
-            <el-radio value="admin_private">管理员专属</el-radio>
+            <el-radio value="external_public">
+              外部公开
+            </el-radio>
+            <el-radio value="internal_shared">
+              内部共享
+            </el-radio>
+            <el-radio value="admin_private">
+              管理员专属
+            </el-radio>
           </el-radio-group>
         </el-form-item>
 
@@ -113,26 +122,53 @@ onBeforeUnmount(stopPolling)
             :file-list="[]"
             :limit="20"
           >
-            <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
-            <div class="el-upload__text">拖拽 PDF 到此处，或<em>点击选择</em></div>
+            <el-icon class="el-icon--upload">
+              <UploadFilled />
+            </el-icon>
+            <div class="el-upload__text">
+              拖拽 PDF 到此处，或<em>点击选择</em>
+            </div>
           </el-upload>
         </el-form-item>
       </el-form>
 
-      <div v-if="selectedFiles.length" class="selected-files">
-        <el-tag v-for="(file, idx) in selectedFiles" :key="`${file.name}-${idx}`" closable size="small" @close="selectedFiles.splice(idx, 1)">
+      <div
+        v-if="selectedFiles.length"
+        class="selected-files"
+      >
+        <el-tag
+          v-for="(file, idx) in selectedFiles"
+          :key="`${file.name}-${idx}`"
+          closable
+          size="small"
+          @close="selectedFiles.splice(idx, 1)"
+        >
           {{ file.name }}
         </el-tag>
       </div>
 
-      <el-button type="primary" :loading="submitting" :disabled="!selectedFiles.length" @click="handleImport">
+      <el-button
+        type="primary"
+        :loading="submitting"
+        :disabled="!selectedFiles.length"
+        @click="handleImport"
+      >
         开始导入
       </el-button>
     </el-card>
 
-    <div v-if="tasks.length" class="task-list">
-      <div v-for="(entry, idx) in tasks" :key="idx" class="task-item">
-        <div class="task-file">{{ entry.item.file_name }}</div>
+    <div
+      v-if="tasks.length"
+      class="task-list"
+    >
+      <div
+        v-for="(entry, idx) in tasks"
+        :key="idx"
+        class="task-item"
+      >
+        <div class="task-file">
+          {{ entry.item.file_name }}
+        </div>
         <template v-if="entry.item.status === 'rejected'">
           <el-alert
             :title="entry.item.error?.message ?? '文件被拒绝'"
@@ -141,8 +177,16 @@ onBeforeUnmount(stopPolling)
             show-icon
           />
         </template>
-        <ImportTaskStatus v-else-if="entry.view" :task="entry.view" />
-        <div v-else class="task-waiting">等待提交结果…</div>
+        <ImportTaskStatus
+          v-else-if="entry.view"
+          :task="entry.view"
+        />
+        <div
+          v-else
+          class="task-waiting"
+        >
+          等待提交结果…
+        </div>
       </div>
     </div>
   </div>

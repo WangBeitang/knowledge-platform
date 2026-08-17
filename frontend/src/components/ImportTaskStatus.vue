@@ -34,28 +34,59 @@ const operationText = computed(() => {
   <div class="import-task-status">
     <div class="task-head">
       <span class="task-op">{{ operationText }}</span>
-      <el-tag :type="task.status === 'succeeded' ? 'success' : task.status === 'failed' ? 'danger' : 'primary'" size="small">
+      <el-tag
+        :type="task.status === 'succeeded' ? 'success' : task.status === 'failed' ? 'danger' : 'primary'"
+        size="small"
+      >
         {{ statusText }}
       </el-tag>
     </div>
 
-    <div v-if="task.running_nodes.length" class="task-nodes">
-      <el-icon class="node-icon running"><Loading /></el-icon>
-      <span v-for="node in task.running_nodes" :key="String(node.name ?? node)" class="node-name">
+    <div
+      v-if="task.running_nodes.length"
+      class="task-nodes"
+    >
+      <el-icon class="node-icon running">
+        <Loading />
+      </el-icon>
+      <span
+        v-for="node in task.running_nodes"
+        :key="String(node.name ?? node)"
+        class="node-name"
+      >
         {{ String(node.name ?? node) }}
       </span>
     </div>
-    <div v-if="task.done_nodes.length" class="task-nodes">
-      <el-icon class="node-icon done"><CircleCheckFilled /></el-icon>
-      <span v-for="node in task.done_nodes" :key="String(node.name ?? node)" class="node-name">
+    <div
+      v-if="task.done_nodes.length"
+      class="task-nodes"
+    >
+      <el-icon class="node-icon done">
+        <CircleCheckFilled />
+      </el-icon>
+      <span
+        v-for="node in task.done_nodes"
+        :key="String(node.name ?? node)"
+        class="node-name"
+      >
         {{ String(node.name ?? node) }}
       </span>
     </div>
-    <div v-if="task.failed_node" class="task-failed">
-      <el-icon class="node-icon failed"><WarningFilled /></el-icon>
+    <div
+      v-if="task.failed_node"
+      class="task-failed"
+    >
+      <el-icon class="node-icon failed">
+        <WarningFilled />
+      </el-icon>
       <span>失败节点：{{ task.failed_node }}</span>
     </div>
-    <div v-if="task.error_message" class="task-error">{{ task.error_message }}</div>
+    <div
+      v-if="task.error_message"
+      class="task-error"
+    >
+      {{ task.error_message }}
+    </div>
   </div>
 </template>
 

@@ -5,7 +5,6 @@ import type {
   ApiResponse,
   DeleteData,
   DocumentImportData,
-  DocumentListResponse,
   ManagedDocumentView,
   PageData,
   RebuildData,
