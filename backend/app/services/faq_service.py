@@ -203,9 +203,7 @@ class FaqService:
             updated_at=updated_at,
         )
 
-    async def delete_faq_cache(
-        self, knowledge_scope: str, normalized_question_hash: str
-    ) -> None:
+    async def delete_faq_cache(self, knowledge_scope: str, normalized_question_hash: str) -> None:
         """下线后删除精确缓存（Redis 不可用不影响正式状态）。"""
         try:
             redis = await get_redis()
@@ -304,9 +302,10 @@ class FaqService:
         operator: User,
         client_ip: str | None,
     ) -> FaqView:
-        """审核并发布：创建正式 FAQ → 写缓存 → 触发范围同步 → 审计。
+        """审核并发布：创建正式 FAQ → 审计 → 写缓存 → 触发范围同步。
 
-        RAG 同步失败不回滚已审核 FAQ（冻结 API §12）。
+        写事务顺序（冻结 API §12）：MySQL 业务状态（faq + candidate + audit）成功
+        → Redis 更新 → submit_faq_sync；RAG 同步失败不回滚已审核 FAQ。
         """
         assert self.candidates is not None and self.audit is not None
         candidate = await self.candidates.get_by_id(candidate_id)
@@ -336,6 +335,8 @@ class FaqService:
             after={"faq_id": faq.id, "knowledge_scope": faq.knowledge_scope},
             client_ip=client_ip,
         )
+        # Redis 外部副作用在 MySQL 事务之后
+        await self.set_faq_cache(faq)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)
 
@@ -370,7 +371,10 @@ class FaqService:
         operator: User,
         client_ip: str | None,
     ) -> FaqView:
-        """直接创建并发布（POST /admin/faqs）。"""
+        """直接创建并发布（POST /admin/faqs）。
+
+        写事务顺序（冻结）：MySQL（faq + audit）成功 → Redis → submit_faq_sync。
+        """
         assert self.audit is not None
         faq = await self._create_faq_inner(
             knowledge_scope=knowledge_scope,
@@ -392,6 +396,7 @@ class FaqService:
             },
             client_ip=client_ip,
         )
+        await self.set_faq_cache(faq)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)
 
@@ -404,7 +409,14 @@ class FaqService:
         operator: User,
         client_ip: str | None,
     ) -> FaqView:
-        """更新完整可变字段：问题重算归一化与哈希，答案更新；写缓存 + 触发同步。"""
+        """更新完整可变字段：问题重算归一化与哈希，答案更新。
+
+        写事务顺序（冻结）：MySQL（faq + audit）成功 → Redis → 触发同步。
+        缓存规则（首轮复核）：
+        - published：写新 hash cache；问题修改后删除旧 hash cache；
+        - unpublished：禁止写 cache，且旧 hash 与新 hash 的 cache 都不存在；
+        - MySQL status 保持不变。
+        """
         assert self.audit is not None
         faq = await self.repository.get_by_id(faq_id)
         if faq is None:
@@ -412,6 +424,8 @@ class FaqService:
         normalized = normalize_question(question)
         if not normalized:
             raise bad_request("归一化后问题为空", code="EMPTY_QUESTION")
+        if not answer or not answer.strip():
+            raise bad_request("答案不能为空")
         new_hash = question_hash(normalized)
         # 同 scope 同 hash 冲突检查（排除自己）
         existing = await self.repository.find_by_scope_hash(
@@ -430,10 +444,6 @@ class FaqService:
             answer=answer.strip(),
             updated_at=now,
         )
-        await self.set_faq_cache(faq)
-        # 问题修改后旧哈希缓存失效（key 含 scope + 新 hash，旧 key 必须删除）
-        if old_hash != new_hash:
-            await self.delete_faq_cache(faq.knowledge_scope, old_hash)
         await self.audit.record(
             operator_user_id=operator.id,
             action=AuditAction.faq_updated.value,
@@ -446,13 +456,24 @@ class FaqService:
             },
             client_ip=client_ip,
         )
+        # Redis 外部副作用在 MySQL 事务之后
+        if faq.status == FaqStatus.published.value:
+            await self.set_faq_cache(faq)
+            if old_hash != new_hash:
+                await self.delete_faq_cache(faq.knowledge_scope, old_hash)
+        else:
+            # unpublished：禁止写 cache，新旧 hash 的 cache 都不存在
+            await self.delete_faq_cache(faq.knowledge_scope, old_hash)
+            if old_hash != new_hash:
+                await self.delete_faq_cache(faq.knowledge_scope, new_hash)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)
 
-    async def unpublish_faq(
-        self, *, faq_id: str, operator: User, client_ip: str | None
-    ) -> FaqView:
-        """下线（不物理删除）：删除缓存 + 触发该范围文档重建。"""
+    async def unpublish_faq(self, *, faq_id: str, operator: User, client_ip: str | None) -> FaqView:
+        """下线（不物理删除）：MySQL 状态 + 审计成功后删除缓存，再触发范围重建。
+
+        写事务顺序（冻结）：MySQL → Redis 删除 → submit_faq_sync。
+        """
         assert self.audit is not None
         faq = await self.repository.get_by_id(faq_id)
         if faq is None:
@@ -466,7 +487,6 @@ class FaqService:
             updated_at=now,
             unpublished_at=now,
         )
-        await self.delete_faq_cache(faq.knowledge_scope, faq.normalized_question_hash)
         await self.audit.record(
             operator_user_id=operator.id,
             action=AuditAction.faq_unpublished.value,
@@ -476,13 +496,12 @@ class FaqService:
             after={"knowledge_scope": faq.knowledge_scope},
             client_ip=client_ip,
         )
+        await self.delete_faq_cache(faq.knowledge_scope, faq.normalized_question_hash)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)
 
-    async def republish_faq(
-        self, *, faq_id: str, operator: User, client_ip: str | None
-    ) -> FaqView:
-        """重新发布：写缓存 + 触发该范围文档重建。"""
+    async def republish_faq(self, *, faq_id: str, operator: User, client_ip: str | None) -> FaqView:
+        """重新发布：MySQL 状态 + 审计成功后写缓存，再触发范围重建。"""
         assert self.audit is not None
         faq = await self.repository.get_by_id(faq_id)
         if faq is None:
@@ -496,7 +515,6 @@ class FaqService:
             updated_at=now,
             unpublished_at=None,
         )
-        await self.set_faq_cache(faq)
         await self.audit.record(
             operator_user_id=operator.id,
             action=AuditAction.faq_republished.value,
@@ -506,6 +524,7 @@ class FaqService:
             after={"knowledge_scope": faq.knowledge_scope},
             client_ip=client_ip,
         )
+        await self.set_faq_cache(faq)
         await self._trigger_sync(faq.knowledge_scope, operator.id)
         return faq_view(faq)
 
@@ -552,7 +571,7 @@ class FaqService:
             updated_at=now,
             unpublished_at=None,
         )
-        await self.set_faq_cache(faq)
+        # 注意：不在此写 Redis 缓存——由调用方在审计（MySQL）之后统一触发
         return faq
 
     async def _trigger_sync(self, knowledge_scope: str, operator_user_id: str) -> None:

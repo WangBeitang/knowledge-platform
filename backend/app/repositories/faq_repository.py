@@ -163,10 +163,12 @@ class FaqRepository(BaseRepository[Faq]):
         rag_sync_error: str | None = None,
         updated_at: datetime | None = None,
     ) -> None:
-        """更新该 FAQ 所在范围的 RAG 文档同步状态（冗余展示字段，事实在 faq_sync_runs）。"""
+        """更新该 FAQ 所在范围的 RAG 文档同步状态（冗余展示字段，事实在 faq_sync_runs）。
+
+        rag_sync_error 始终写入：传 None 显式清空为 NULL（成功/同步中不得残留旧失败摘要）。
+        """
         faq.rag_sync_status = rag_sync_status
-        if rag_sync_error is not None:
-            faq.rag_sync_error = rag_sync_error[:1000] if rag_sync_error else None
+        faq.rag_sync_error = rag_sync_error[:1000] if rag_sync_error else None
         if updated_at is not None:
             faq.updated_at = updated_at
         await self.session.flush()
@@ -179,10 +181,16 @@ class FaqRepository(BaseRepository[Faq]):
         rag_sync_error: str | None = None,
         updated_at: datetime,
     ) -> None:
-        """批量更新某 scope 全部 published FAQ 的 RAG 同步状态（同步事件触发时调用）。"""
-        values: dict = {"rag_sync_status": rag_sync_status, "updated_at": updated_at}
-        if rag_sync_error is not None:
-            values["rag_sync_error"] = rag_sync_error[:1000] if rag_sync_error else None
+        """批量更新某 scope 全部 published FAQ 的 RAG 同步状态（同步事件触发时调用）。
+
+        rag_sync_error 始终写入：syncing/succeeded 传 None 显式清空为 NULL；
+        failed 传真实安全摘要（首轮复核修复：失败残留不得在成功后被保留）。
+        """
+        values: dict = {
+            "rag_sync_status": rag_sync_status,
+            "rag_sync_error": rag_sync_error[:1000] if rag_sync_error else None,
+            "updated_at": updated_at,
+        }
         await self.session.execute(
             update(Faq)
             .where(

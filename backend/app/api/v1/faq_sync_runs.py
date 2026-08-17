@@ -39,6 +39,7 @@ async def list_sync_runs(
         status=status,
         sort_by=sort_by,
         sort_order=sort_order,
+        operator_user_id=admin.id,
     )
     return FaqSyncRunListResponse(
         request_id=get_request_id(),

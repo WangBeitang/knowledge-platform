@@ -134,6 +134,23 @@ class FaqSyncRunRepository(BaseRepository[FaqSyncRun]):
         )
         return await self.session.scalar(stmt)
 
+    async def find_latest_in_progress(self, knowledge_scope: str) -> FaqSyncRun | None:
+        """该范围最新一条进行中（pending/syncing）同步记录（单进行中防分叉）。
+
+        首轮复核：同一 scope 同时最多一个真实 RAG FAQ upload——
+        提交前检查本方法，存在进行中 run 时不再启动第二次上传。
+        """
+        stmt = (
+            select(FaqSyncRun)
+            .where(
+                FaqSyncRun.knowledge_scope == knowledge_scope,
+                FaqSyncRun.status.in_(["pending", "syncing"]),
+            )
+            .order_by(FaqSyncRun.created_at.desc())
+            .limit(1)
+        )
+        return await self.session.scalar(stmt)
+
     async def find_runs_needing_refresh(self) -> list[FaqSyncRun]:
         """所有 pending/syncing 的同步记录（查询列表时刷新上游任务状态）。"""
         stmt = (
@@ -159,9 +176,7 @@ class FaqSyncRunRepository(BaseRepository[FaqSyncRun]):
         run.error_message = None
         await self.session.flush()
 
-    async def mark_succeeded(
-        self, run: FaqSyncRun, *, finished_at: datetime
-    ) -> None:
+    async def mark_succeeded(self, run: FaqSyncRun, *, finished_at: datetime) -> None:
         """旧文档清理成功（或无旧文档）：标记 succeeded。"""
         run.status = "succeeded"
         run.error_code = None

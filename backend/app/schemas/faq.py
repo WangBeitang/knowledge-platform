@@ -94,6 +94,7 @@ class FaqSyncRunView(BaseModel):
 
 # ---- 响应壳 ----
 
+
 class AnalyzeData(BaseModel):
     created: int
     updated: int
@@ -133,4 +134,10 @@ class FaqDetailResponse(ApiResponse[FaqView]):
 
 
 class FaqSyncRunListResponse(ApiResponse[FaqSyncRunListData]):
+    pass
+
+
+class FaqSyncRunDetailResponse(ApiResponse[FaqSyncRunView]):
+    """sync:retry 响应：全局 {request_id, data: FaqSyncRunView} 契约（首轮复核）。"""
+
     pass

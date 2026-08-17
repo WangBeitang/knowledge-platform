@@ -19,11 +19,13 @@ import uuid
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from app.core.enums import FaqStatus
 from app.core.normalizer import normalize_question, question_hash
 from app.core.redis import get_redis
 from app.core.time import utc_now_naive
+from app.models.faq import Faq
 from app.rag.rag_document_client import RagDocumentClient
 from app.rag.rag_import_client import RagImportClient
 from app.repositories.audit_log_repository import AuditLogRepository
@@ -121,15 +123,9 @@ async def faq_cleanup(db_session):
     await db_session.commit()
 
     for scope in scopes:
-        await db_session.execute(
-            delete(FaqSyncRun).where(FaqSyncRun.knowledge_scope == scope)
-        )
+        await db_session.execute(delete(FaqSyncRun).where(FaqSyncRun.knowledge_scope == scope))
         faqs = list(
-            (
-                await db_session.scalars(
-                    select(Faq).where(Faq.knowledge_scope == scope)
-                )
-            ).all()
+            (await db_session.scalars(select(Faq).where(Faq.knowledge_scope == scope))).all()
         )
         for faq in faqs:
             await db_session.execute(delete(Faq).where(Faq.id == faq.id))
@@ -137,9 +133,7 @@ async def faq_cleanup(db_session):
                 await db_session.execute(
                     delete(FaqCandidate).where(FaqCandidate.id == faq.source_candidate_id)
                 )
-        await db_session.execute(
-            delete(FaqCandidate).where(FaqCandidate.knowledge_scope == scope)
-        )
+        await db_session.execute(delete(FaqCandidate).where(FaqCandidate.knowledge_scope == scope))
     await db_session.commit()
 
     redis = await get_redis()
@@ -229,21 +223,25 @@ def _scope_docs(fake: FakeRag, scope: str) -> list[dict]:
 
 
 class TestAnalyze:
-    async def test_analyze_generates_candidates(
-        self, client, admin_user, db_session, faq_cleanup
-    ):
+    async def test_analyze_generates_candidates(self, client, admin_user, db_session, faq_cleanup):
         token = await _admin_token(client, admin_user)
         # 唯一问题文本：避免与真实开发库历史日志碰撞（全量聚合按 hash 计数）
         tag = uuid.uuid4().hex[:8]
         q1 = f"如何办理风险测评{tag}？"
         q2 = f"忘记密码怎么办{tag}？"
         h1 = await _seed_logs(
-            db_session, admin_user_id=admin_user["user_id"], question=q1,
-            ask_count=3, allowed_scopes=["internal_shared", "external_public"],
+            db_session,
+            admin_user_id=admin_user["user_id"],
+            question=q1,
+            ask_count=3,
+            allowed_scopes=["internal_shared", "external_public"],
         )
         h2 = await _seed_logs(
-            db_session, admin_user_id=admin_user["user_id"], question=q2,
-            ask_count=2, allowed_scopes=["admin_private", "internal_shared", "external_public"],
+            db_session,
+            admin_user_id=admin_user["user_id"],
+            question=q2,
+            ask_count=2,
+            allowed_scopes=["admin_private", "internal_shared", "external_public"],
         )
         faq_cleanup("internal_shared", h1)
         faq_cleanup("admin_private", h2)
@@ -272,14 +270,15 @@ class TestAnalyze:
         assert by_hash[h2]["ask_count"] == 2
         assert by_hash[h2]["knowledge_scope"] == "admin_private"
 
-    async def test_repeat_analyze_dedup(
-        self, client, admin_user, db_session, faq_cleanup
-    ):
+    async def test_repeat_analyze_dedup(self, client, admin_user, db_session, faq_cleanup):
         token = await _admin_token(client, admin_user)
         tag = uuid.uuid4().hex[:8]
         h = await _seed_logs(
-            db_session, admin_user_id=admin_user["user_id"], question=f"重复分析问题{tag}？",
-            ask_count=3, allowed_scopes=["internal_shared", "external_public"],
+            db_session,
+            admin_user_id=admin_user["user_id"],
+            question=f"重复分析问题{tag}？",
+            ask_count=3,
+            allowed_scopes=["internal_shared", "external_public"],
         )
         faq_cleanup("internal_shared", h)
 
@@ -312,8 +311,11 @@ class TestAnalyze:
         )
         faq_cleanup("internal_shared", faq["normalized_question_hash"])
         await _seed_logs(
-            db_session, admin_user_id=admin_user["user_id"], question=question,
-            ask_count=2, allowed_scopes=["internal_shared", "external_public"],
+            db_session,
+            admin_user_id=admin_user["user_id"],
+            question=question,
+            ask_count=2,
+            allowed_scopes=["internal_shared", "external_public"],
         )
         resp = await client.post(
             "/api/v1/admin/faq-candidates/analyze",
@@ -327,32 +329,36 @@ class TestAnalyze:
             "/api/v1/admin/faq-candidates?page_size=50",
             headers=await bearer_headers(token),
         )
-        assert not [i for i in lst.json()["data"]["items"]
-                    if i["normalized_question_hash"] == faq["normalized_question_hash"]]
+        assert not [
+            i
+            for i in lst.json()["data"]["items"]
+            if i["normalized_question_hash"] == faq["normalized_question_hash"]
+        ]
 
 
 class TestCandidateReview:
-    async def test_reject_candidate(
-        self, client, admin_user, db_session, faq_cleanup
-    ):
+    async def test_reject_candidate(self, client, admin_user, db_session, faq_cleanup):
         token = await _admin_token(client, admin_user)
         tag = uuid.uuid4().hex[:8]
         h = await _seed_logs(
-            db_session, admin_user_id=admin_user["user_id"], question=f"应该拒绝的问题{tag}",
-            ask_count=1, allowed_scopes=["internal_shared", "external_public"],
+            db_session,
+            admin_user_id=admin_user["user_id"],
+            question=f"应该拒绝的问题{tag}",
+            ask_count=1,
+            allowed_scopes=["internal_shared", "external_public"],
         )
         faq_cleanup("internal_shared", h)
         await client.post(
             "/api/v1/admin/faq-candidates/analyze",
-            headers=await bearer_headers(token), json={},
+            headers=await bearer_headers(token),
+            json={},
         )
         lst = await client.get(
             "/api/v1/admin/faq-candidates?page_size=50",
             headers=await bearer_headers(token),
         )
         cid = next(
-            i["id"] for i in lst.json()["data"]["items"]
-            if i["normalized_question_hash"] == h
+            i["id"] for i in lst.json()["data"]["items"] if i["normalized_question_hash"] == h
         )
         resp = await client.post(
             f"/api/v1/admin/faq-candidates/{cid}/reject",
@@ -375,21 +381,24 @@ class TestCandidateReview:
         tag = uuid.uuid4().hex[:8]
         question = f"候选审核发布问题{tag}？"
         h = await _seed_logs(
-            db_session, admin_user_id=admin_user["user_id"], question=question,
-            ask_count=2, allowed_scopes=["internal_shared", "external_public"],
+            db_session,
+            admin_user_id=admin_user["user_id"],
+            question=question,
+            ask_count=2,
+            allowed_scopes=["internal_shared", "external_public"],
         )
         faq_cleanup("internal_shared", h)
         await client.post(
             "/api/v1/admin/faq-candidates/analyze",
-            headers=await bearer_headers(token), json={},
+            headers=await bearer_headers(token),
+            json={},
         )
         lst = await client.get(
             "/api/v1/admin/faq-candidates?page_size=50",
             headers=await bearer_headers(token),
         )
         cid = next(
-            i["id"] for i in lst.json()["data"]["items"]
-            if i["normalized_question_hash"] == h
+            i["id"] for i in lst.json()["data"]["items"] if i["normalized_question_hash"] == h
         )
         resp = await client.post(
             f"/api/v1/admin/faq-candidates/{cid}/publish",
@@ -412,18 +421,14 @@ class TestCandidateReview:
         from app.models.faq import Faq
 
         await db_session.commit()  # 刷新快照看到请求已提交的写
-        row = await db_session.scalar(
-            select(Faq).where(Faq.id == faq["id"])
-        )
+        row = await db_session.scalar(select(Faq).where(Faq.id == faq["id"]))
         assert row is not None
         assert row.status == FaqStatus.published.value
 
         # 候选标记已发布
         from app.models.faq_candidate import FaqCandidate
 
-        cand_row = await db_session.scalar(
-            select(FaqCandidate).where(FaqCandidate.id == cid)
-        )
+        cand_row = await db_session.scalar(select(FaqCandidate).where(FaqCandidate.id == cid))
         assert cand_row.status == "published"
         assert cand_row.published_faq_id == faq["id"]
 
@@ -516,6 +521,7 @@ class TestFaqCrud:
         if redis is not None:
             assert await redis.get(faq_cache_key("internal_shared", old_hash)) is not None
 
+        # 单进行中防分叉：publish 上传未完成前 PATCH 不启动第二次上传
         resp = await client.patch(
             f"/api/v1/admin/faqs/{faq['id']}",
             headers=await bearer_headers(token),
@@ -532,7 +538,25 @@ class TestFaqCrud:
             # 旧 key 失效、新 key 写入
             assert await redis.get(faq_cache_key("internal_shared", old_hash)) is None
             assert await redis.get(faq_cache_key("internal_shared", new_hash)) is not None
-        # 触发该范围文档重建（第二次上传）
+        assert fake.upload_calls == 1  # publish 上传未完成，不触发第二次上传
+
+        # 完成第一轮上传后再次修改 → 触发该范围文档重建（第二次上传）
+        rag_task_id = list(fake.tasks)[-1]  # 最新上传任务（publish 的 doc1）
+        rag_doc_id = fake.tasks[rag_task_id]["document_id"]
+        fake.set_task_status(rag_task_id, "completed", done=[{"name": "upload_file"}])
+        fake.documents[rag_doc_id]["status"] = "completed"
+        await client.get(
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
+        )
+        resp = await client.patch(
+            f"/api/v1/admin/faqs/{faq['id']}",
+            headers=await bearer_headers(token),
+            json={"question": "修改后问题三", "answer": "答案三"},
+        )
+        assert resp.status_code == 200, resp.text
+        h3 = resp.json()["data"]["normalized_question_hash"]
+        faq_cleanup("internal_shared", h3)
         assert fake.upload_calls == 2
 
     async def test_unpublish_removes_cache_and_republish_restores(
@@ -676,7 +700,8 @@ class TestSyncStateMachine:
         faq_cleanup("internal_shared", h1)
         await self._complete_upload(fake)
         lst = await client.get(
-            "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
         )
         run1 = lst.json()["data"]["items"][0]
         assert run1["status"] == "succeeded"
@@ -694,7 +719,8 @@ class TestSyncStateMachine:
 
         await self._complete_upload(fake)
         lst = await client.get(
-            "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
         )
         runs = lst.json()["data"]["items"]
         assert len(runs) == 2
@@ -719,7 +745,8 @@ class TestSyncStateMachine:
         faq_cleanup("internal_shared", h1)
         await self._complete_upload(fake)
         lst = await client.get(
-            "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
         )
         old_doc_id = lst.json()["data"]["items"][0]["rag_document_id"]
 
@@ -735,7 +762,8 @@ class TestSyncStateMachine:
         faq_cleanup("internal_shared", h2)
 
         lst = await client.get(
-            "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
         )
         run = lst.json()["data"]["items"][0]
         assert run["status"] == "failed"
@@ -767,7 +795,8 @@ class TestSyncStateMachine:
         faq_cleanup("internal_shared", h1)
         await self._complete_upload(fake)
         lst = await client.get(
-            "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
         )
         old_doc_id = lst.json()["data"]["items"][0]["rag_document_id"]
 
@@ -783,7 +812,8 @@ class TestSyncStateMachine:
         fake.fail_delete = True
         await self._complete_upload(fake)
         lst = await client.get(
-            "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
         )
         run = lst.json()["data"]["items"][0]
         assert run["status"] == "failed"
@@ -798,7 +828,10 @@ class TestSyncStateMachine:
             headers=await bearer_headers(token),
         )
         assert retry_resp.status_code == 200, retry_resp.text
-        assert retry_resp.json()["status"] == "succeeded"
+        # sync:retry 遵循全局契约 {request_id, data: FaqSyncRunView}
+        retry_body = retry_resp.json()
+        assert "request_id" in retry_body and "data" in retry_body
+        assert retry_body["data"]["status"] == "succeeded"
         assert fake.upload_calls == uploads_before  # 未重新上传
         assert fake.delete_calls == 2  # 第一次失败 + 重试成功
 
@@ -810,7 +843,8 @@ class TestSyncStateMachine:
         # 防御：先刷新一次，把历史残留 pending/syncing run 处理为终态，
         # 避免测试间污染（残留 run 在上游 404 → 保守 failed，不影响后续断言）
         await client.get(
-            "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
         )
         faq = await _publish_faq(
             client, token, scope="admin_private", question="并发清理问题", answer="答案"
@@ -819,7 +853,8 @@ class TestSyncStateMachine:
         faq_cleanup("admin_private", h)
         await self._complete_upload(fake)
         lst = await client.get(
-            "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
         )
         old_doc_id = lst.json()["data"]["items"][0]["rag_document_id"]
 
@@ -836,7 +871,8 @@ class TestSyncStateMachine:
         # 并发刷新 faq-sync-runs（行锁保证删除只执行一次）
         async def _refresh():
             return await client.get(
-                "/api/v1/admin/faq-sync-runs", headers=await bearer_headers(token),
+                "/api/v1/admin/faq-sync-runs",
+                headers=await bearer_headers(token),
             )
 
         results = await asyncio.gather(*[_refresh() for _ in range(5)])
@@ -881,7 +917,9 @@ class TestAudit:
         from app.models.audit_log import AuditLog
 
         total = await db_session.scalar(
-            select(func.count()).select_from(AuditLog).where(
+            select(func.count())
+            .select_from(AuditLog)
+            .where(
                 AuditLog.operator_user_id == admin_user["user_id"],
                 AuditLog.action.in_(
                     ["faq_created", "faq_updated", "faq_unpublished", "faq_republished"]
@@ -889,3 +927,410 @@ class TestAudit:
             )
         )
         assert total == 4
+
+
+class TestFirstReviewFixes:
+    """Stage 5 Batch 1 首轮复核修复：unpublished 缓存、sync:retry 契约、单进行中防分叉、
+    空 answer 校验、rag_sync_error 清理、写事务顺序。"""
+
+    async def test_unpublished_patch_never_writes_cache(
+        self, client, admin_user, db_session, faq_cleanup, faq_rag_factory
+    ):
+        """publish → unpublish → PATCH：新旧 hash 的 cache 都不存在，lookup miss。"""
+        faq_rag_factory(FakeRag(), db_session)
+        token = await _admin_token(client, admin_user)
+        faq = await _publish_faq(
+            client, token, scope="internal_shared", question="下线后修改问题？", answer="旧答案"
+        )
+        old_hash = faq["normalized_question_hash"]
+        faq_cleanup("internal_shared", old_hash)
+
+        redis = await get_redis()
+        if redis is None:
+            pytest.skip("Redis 不可达，跳过缓存断言")
+        assert await redis.get(faq_cache_key("internal_shared", old_hash)) is not None
+
+        # 下线：缓存删除
+        resp = await client.post(
+            f"/api/v1/admin/faqs/{faq['id']}/unpublish",
+            headers=await bearer_headers(token),
+        )
+        assert resp.status_code == 200
+        assert await redis.get(faq_cache_key("internal_shared", old_hash)) is None
+
+        # 下线后 PATCH（问题也改了）
+        resp = await client.patch(
+            f"/api/v1/admin/faqs/{faq['id']}",
+            headers=await bearer_headers(token),
+            json={"question": "下线后修改问题v2", "answer": "新答案"},
+        )
+        assert resp.status_code == 200
+        updated = resp.json()["data"]
+        new_hash = updated["normalized_question_hash"]
+        assert updated["status"] == "unpublished"  # MySQL status 不变
+        faq_cleanup("internal_shared", new_hash)
+
+        # 新旧 hash 的 cache 都不存在（unpublished 禁止写 cache）
+        assert await redis.get(faq_cache_key("internal_shared", old_hash)) is None
+        assert await redis.get(faq_cache_key("internal_shared", new_hash)) is None
+
+        # Stage 4 FAQ lookup：新旧 hash 都 miss
+        service = FaqService(repository=FaqRepository(db_session))
+        for h in (old_hash, new_hash):
+            hit = await service.lookup_exact_faq(
+                scopes=["internal_shared"],
+                normalized_question="x",
+                normalized_question_hash=h,
+            )
+            assert hit is None, f"unpublished FAQ 的 hash={h} 不应命中"
+
+        # 重新发布后缓存恢复
+        resp = await client.post(
+            f"/api/v1/admin/faqs/{faq['id']}/publish",
+            headers=await bearer_headers(token),
+        )
+        assert resp.status_code == 200
+        assert await redis.get(faq_cache_key("internal_shared", new_hash)) is not None
+
+    async def test_sync_retry_response_contract(
+        self, client, admin_user, db_session, faq_cleanup, faq_rag_factory
+    ):
+        """sync:retry 响应遵循全局 {request_id, data: FaqSyncRunView} 契约。"""
+        fake = faq_rag_factory(FakeRag(), db_session)
+        token = await _admin_token(client, admin_user)
+        faq = await _publish_faq(
+            client, token, scope="internal_shared", question="契约测试问题", answer="答案"
+        )
+        h = faq["normalized_question_hash"]
+        faq_cleanup("internal_shared", h)
+        await self._complete_upload(fake)
+        await client.get(
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
+        )
+
+        resp = await client.post(
+            f"/api/v1/admin/faqs/{faq['id']}/sync:retry",
+            headers=await bearer_headers(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # 全局壳：request_id + data（data 为 FaqSyncRunView，含 status）
+        assert "request_id" in body and "data" in body
+        assert body["data"]["status"] == "succeeded"
+        assert body["data"]["knowledge_scope"] == "internal_shared"
+
+    async def test_single_in_progress_no_fork_and_catch_up(
+        self, client, admin_user, db_session, faq_cleanup, faq_rag_factory
+    ):
+        """doc1 succeeded → 修改产生 doc2 syncing → doc2 未完成前再修改不立即上传 →
+        doc2 成功后自动 catch-up doc3（previous=doc2）→ doc3 成功后 doc2 被删除，
+        最终 Dataset 只保留最新文档。"""
+        fake = faq_rag_factory(FakeRag(), db_session)
+        token = await _admin_token(client, admin_user)
+        faq = await _publish_faq(
+            client, token, scope="admin_private", question="分叉问题一", answer="答案一"
+        )
+        h1 = faq["normalized_question_hash"]
+        faq_cleanup("admin_private", h1)
+        # doc1 succeeded
+        await self._complete_upload(fake)
+        await client.get(
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
+        )
+        doc1_id = fake.tasks[list(fake.tasks)[-1]]["document_id"]
+
+        # 修改 → doc2 上传（syncing）
+        resp = await client.patch(
+            f"/api/v1/admin/faqs/{faq['id']}",
+            headers=await bearer_headers(token),
+            json={"question": "分叉问题二", "answer": "答案二"},
+        )
+        assert resp.status_code == 200
+        h2 = resp.json()["data"]["normalized_question_hash"]
+        faq_cleanup("admin_private", h2)
+        uploads_after_patch = fake.upload_calls
+        assert uploads_after_patch == 2  # doc1 + doc2
+        runs = (
+            await client.get(
+                "/api/v1/admin/faq-sync-runs",
+                headers=await bearer_headers(token),
+            )
+        ).json()["data"]["items"]
+        run2 = runs[0]  # 最新 run（doc2，进行中）
+        doc2_id = run2["rag_document_id"]
+
+        # doc2 未完成前再次修改 → 不立即上传 doc3（单进行中防分叉）
+        resp = await client.patch(
+            f"/api/v1/admin/faqs/{faq['id']}",
+            headers=await bearer_headers(token),
+            json={"question": "分叉问题三", "answer": "答案三"},
+        )
+        assert resp.status_code == 200
+        h3 = resp.json()["data"]["normalized_question_hash"]
+        faq_cleanup("admin_private", h3)
+        assert fake.upload_calls == uploads_after_patch  # 未上传 doc3
+
+        # doc2 completed → refresh：run2 succeeded + catch-up 自动上传 doc3（previous=doc2）
+        await self._complete_upload(fake)
+        runs = (
+            await client.get(
+                "/api/v1/admin/faq-sync-runs",
+                headers=await bearer_headers(token),
+            )
+        ).json()["data"]["items"]
+        assert fake.upload_calls == uploads_after_patch + 1  # catch-up 上传 doc3
+        run3 = runs[0]  # 最新 run（catch-up 的 doc3）
+        assert run3["previous_rag_document_id"] == doc2_id  # previous 指向刚成功的新文档
+        # run2 已 succeeded 且其 previous(doc1) 已被清理
+        run2_now = runs[1]
+        assert run2_now["status"] == "succeeded"
+        assert run2_now["previous_rag_document_id"] == doc1_id
+        doc3_id = run3["rag_document_id"]
+
+        # doc3 completed → refresh：doc2 被删除，最终只剩 doc3
+        await self._complete_upload(fake)
+        runs = (
+            await client.get(
+                "/api/v1/admin/faq-sync-runs",
+                headers=await bearer_headers(token),
+            )
+        ).json()["data"]["items"]
+        run3_now = runs[0]
+        assert run3_now["status"] == "succeeded"
+        assert run3_now["previous_rag_document_id"] == doc2_id
+        # doc1、doc2 已删除；Dataset 只保留 doc3
+        for doc_id in (doc1_id, doc2_id):
+            d = fake.document(doc_id)
+            assert d is None or d["status"] == "deleted", f"{doc_id} 应已删除"
+        assert fake.document(doc3_id) is not None
+        assert fake.document(doc3_id)["status"] == "completed"
+        # 该 Dataset 只保留一份有效文档
+        live = [d for d in fake.documents.values() if d["status"] != "deleted"]
+        assert len(live) == 1 and live[0]["document_id"] == doc3_id
+
+    async def test_late_failed_run_not_override_newer_scope_status(
+        self, client, admin_user, db_session, faq_cleanup, faq_rag_factory
+    ):
+        """旧 run 迟到的 failed 不得覆盖更新 run 的 scope 展示状态。"""
+        fake = faq_rag_factory(FakeRag(), db_session)
+        token = await _admin_token(client, admin_user)
+        faq = await _publish_faq(
+            client, token, scope="internal_shared", question="迟到问题一", answer="答案一"
+        )
+        h1 = faq["normalized_question_hash"]
+        faq_cleanup("internal_shared", h1)
+        await self._complete_upload(fake)
+        await client.get(
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
+        )
+        # 修改产生 doc2（syncing）
+        resp = await client.patch(
+            f"/api/v1/admin/faqs/{faq['id']}",
+            headers=await bearer_headers(token),
+            json={"question": "迟到问题二", "answer": "答案二"},
+        )
+        h2 = resp.json()["data"]["normalized_question_hash"]
+        faq_cleanup("internal_shared", h2)
+        # 修改产生内容变化（doc2 仍进行中，不新上传）
+        resp = await client.patch(
+            f"/api/v1/admin/faqs/{faq['id']}",
+            headers=await bearer_headers(token),
+            json={"question": "迟到问题三", "answer": "答案三"},
+        )
+        h3 = resp.json()["data"]["normalized_question_hash"]
+        faq_cleanup("internal_shared", h3)
+
+        # doc2 completed → refresh → run2 succeeded + catch-up 创建 doc3（scope=syncing）
+        await self._complete_upload(fake)
+        await client.get(
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
+        )
+        await db_session.commit()
+        rows = list(
+            (
+                await db_session.scalars(
+                    select(Faq).where(
+                        Faq.knowledge_scope == "internal_shared", Faq.status == "published"
+                    )
+                )
+            ).all()
+        )
+        assert rows and rows[0].rag_sync_status == "syncing"  # doc3 进行中展示
+
+        # 模拟 doc2 的迟到 failed：直接调 service（此时 doc3 是 scope 最新 run）
+        import_client, document_client = _make_clients(fake)
+        svc = FaqSyncService(
+            runs=FaqSyncRunRepository(db_session),
+            faqs=FaqRepository(db_session),
+            import_client=import_client,
+            document_client=document_client,
+        )
+        from app.models.faq_sync_run import FaqSyncRun as _Run
+
+        # doc2 的 run = scope 内第二新的记录（第一个是 catch-up 的 doc3）
+        scope_runs = list(
+            (
+                await db_session.scalars(
+                    select(_Run)
+                    .where(_Run.knowledge_scope == "internal_shared")
+                    .order_by(_Run.created_at.desc())
+                )
+            ).all()
+        )
+        run2_row = scope_runs[1]
+        await svc._mark_failed_with_scope(
+            run2_row, error_code="RAG_IMPORT_FAILED", error_message="迟到失败"
+        )
+        await db_session.commit()
+        # scope 展示状态未被旧 run 覆盖（仍是 syncing，doc3 进行中）
+        rows = list(
+            (
+                await db_session.scalars(
+                    select(Faq).where(
+                        Faq.knowledge_scope == "internal_shared", Faq.status == "published"
+                    )
+                )
+            ).all()
+        )
+        assert rows[0].rag_sync_status == "syncing"
+
+        # doc3 completed → refresh → 最终 succeeded，error 清理
+        await self._complete_upload(fake)
+        await client.get(
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
+        )
+        # commit 结束旧事务快照 + expire identity map（expire_on_commit=False）
+        await db_session.commit()
+        db_session.expire_all()
+        rows = list(
+            (
+                await db_session.scalars(
+                    select(Faq).where(
+                        Faq.knowledge_scope == "internal_shared", Faq.status == "published"
+                    )
+                )
+            ).all()
+        )
+        assert rows[0].rag_sync_status == "succeeded"
+        assert rows[0].rag_sync_error is None
+
+    async def test_empty_answer_rejected_no_side_effects(
+        self, client, admin_user, db_session, faq_cleanup, faq_rag_factory
+    ):
+        """create / PATCH 空 answer：稳定 400，不写库、不写 Redis、不触发 sync。"""
+        fake = faq_rag_factory(FakeRag(), db_session)
+        token = await _admin_token(client, admin_user)
+
+        # create 空 answer
+        resp = await client.post(
+            "/api/v1/admin/faqs",
+            headers=await bearer_headers(token),
+            json={"knowledge_scope": "internal_shared", "question": "空答案问题", "answer": "   "},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == "INVALID_REQUEST"
+        assert fake.upload_calls == 0  # 空 answer 不触发上传
+
+        # 合法创建后 PATCH 空 answer
+        faq = await _publish_faq(
+            client, token, scope="internal_shared", question="空答案问题", answer="正常答案"
+        )
+        h = faq["normalized_question_hash"]
+        faq_cleanup("internal_shared", h)
+        uploads_before = fake.upload_calls
+        resp = await client.patch(
+            f"/api/v1/admin/faqs/{faq['id']}",
+            headers=await bearer_headers(token),
+            json={"question": "空答案问题", "answer": ""},
+        )
+        assert resp.status_code == 400
+
+        # 无副作用：未触发 upload、MySQL answer 未变、Redis 未写空答案
+        assert fake.upload_calls == uploads_before
+        await db_session.commit()
+        from sqlalchemy import select
+
+        from app.models.faq import Faq
+
+        row = await db_session.scalar(select(Faq).where(Faq.id == faq["id"]))
+        assert row.answer == "正常答案"
+
+    async def test_rag_sync_error_cleared_after_success(
+        self, client, admin_user, db_session, faq_cleanup, faq_rag_factory
+    ):
+        """failed → retry → succeeded：published FAQ 状态=succeeded 且 error=NULL。"""
+        fake = faq_rag_factory(FakeRag(), db_session)
+        token = await _admin_token(client, admin_user)
+        faq = await _publish_faq(
+            client, token, scope="internal_shared", question="错误清理问题一", answer="答案一"
+        )
+        h1 = faq["normalized_question_hash"]
+        faq_cleanup("internal_shared", h1)
+        await self._complete_upload(fake)
+        await client.get(
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
+        )
+
+        # 修改 → 上传失败 → sync failed，FAQ 展示 failed + error
+        fake.fail_upload = True
+        resp = await client.patch(
+            f"/api/v1/admin/faqs/{faq['id']}",
+            headers=await bearer_headers(token),
+            json={"question": "错误清理问题二", "answer": "答案二"},
+        )
+        h2 = resp.json()["data"]["normalized_question_hash"]
+        faq_cleanup("internal_shared", h2)
+        await db_session.commit()
+        rows = list(
+            (
+                await db_session.scalars(
+                    select(Faq).where(
+                        Faq.knowledge_scope == "internal_shared", Faq.status == "published"
+                    )
+                )
+            ).all()
+        )
+        assert rows[0].rag_sync_status == "failed"
+        assert rows[0].rag_sync_error is not None
+
+        # retry（恢复上游）→ 新 run upload → complete → refresh → succeeded，error 清理
+        fake.fail_upload = False
+        retry_resp = await client.post(
+            f"/api/v1/admin/faqs/{faq['id']}/sync:retry",
+            headers=await bearer_headers(token),
+        )
+        assert retry_resp.status_code == 200, retry_resp.text
+        await self._complete_upload(fake)
+        await client.get(
+            "/api/v1/admin/faq-sync-runs",
+            headers=await bearer_headers(token),
+        )
+        # commit 结束旧事务快照 + expire identity map（expire_on_commit=False）
+        await db_session.commit()
+        db_session.expire_all()
+        rows = list(
+            (
+                await db_session.scalars(
+                    select(Faq).where(
+                        Faq.knowledge_scope == "internal_shared", Faq.status == "published"
+                    )
+                )
+            ).all()
+        )
+        assert rows[0].rag_sync_status == "succeeded"
+        assert rows[0].rag_sync_error is None
+
+    # ---------- 复用 TestSyncStateMachine 的上传推进 helper ----------
+
+    async def _complete_upload(self, fake: FakeRag) -> None:
+        """把最新上传任务置为 completed，并确认文档快照可查。"""
+        rag_task_id = list(fake.tasks)[-1]
+        rag_doc_id = fake.tasks[rag_task_id]["document_id"]
+        fake.set_task_status(rag_task_id, "completed", done=[{"name": "upload_file"}])
+        fake.documents[rag_doc_id]["status"] = "completed"

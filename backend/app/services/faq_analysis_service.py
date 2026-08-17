@@ -9,7 +9,6 @@
 - 不修改 Stage 4 问答链路（本服务只读 qa_access_logs）。
 """
 
-
 from app.core.enums import FaqStatus
 from app.core.time import utc_now_naive
 from app.repositories.faq_candidate_repository import FaqCandidateRepository

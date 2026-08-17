@@ -15,7 +15,7 @@ from app.schemas.faq import (
     FaqDetailResponse,
     FaqListData,
     FaqListResponse,
-    FaqSyncRunView,
+    FaqSyncRunDetailResponse,
     FaqUpdateRequest,
 )
 from app.services.audit_service import AuditService
@@ -139,18 +139,17 @@ async def republish_faq(
     return FaqDetailResponse(request_id=get_request_id(), data=view)
 
 
-class SyncRetryData(FaqSyncRunView):
-    """sync:retry 返回同步记录视图（前端以 faq-sync-runs 轮询为准）。"""
-
-
-@router.post("/{faq_id}/sync:retry", response_model=FaqSyncRunView)
+@router.post("/{faq_id}/sync:retry", response_model=FaqSyncRunDetailResponse)
 async def retry_sync(
     request: Request,
     faq_id: str,
     admin: User = Depends(require_admin),
     session: AsyncSession = Depends(get_db),
-) -> FaqSyncRunView:
-    """重试对应范围 RAG 同步：按 FAQ 的 scope 定位最新同步记录。"""
+) -> FaqSyncRunDetailResponse:
+    """重试对应范围 RAG 同步：按 FAQ 的 scope 定位最新同步记录。
+
+    响应遵循全局契约 {request_id, data: FaqSyncRunView}（首轮复核修复）。
+    """
     faq = await FaqRepository(session).get_by_id(faq_id)
     if faq is None:
         raise not_found("FAQ 不存在")
@@ -178,4 +177,4 @@ async def retry_sync(
         },
         client_ip=await _client_ip(request),
     )
-    return sync_run_view(run)
+    return FaqSyncRunDetailResponse(request_id=get_request_id(), data=sync_run_view(run))
