@@ -115,14 +115,24 @@ class RagQueryClient:
                 json=body,
             )
         except httpx.TimeoutException as exc:
-            raise map_http_error(exc) from exc
+            # 网络层超时：上游是否已接受本请求存在不确定性（可能已接受并开始执行）
+            err = map_http_error(exc)
+            err.acceptance_ambiguous = True
+            raise err from exc
         except httpx.HTTPError as exc:
-            raise map_http_error(exc) from exc
+            # 连接层断开：同上，接受与否不确定
+            err = map_http_error(exc)
+            err.acceptance_ambiguous = True
+            raise err from exc
         # 上游显式服务不可用/网关超时 → 稳定错误码（冻结 API §15）
         if resp.status_code == 503:
+            # 上游明确拒绝（本请求未接受）：非歧义
             raise rag_unavailable()
         if resp.status_code == 504:
-            raise rag_timeout()
+            # 网关超时：请求可能已到达上游并被接受 → 保守按歧义处理
+            err = rag_timeout()
+            err.acceptance_ambiguous = True
+            raise err
         if resp.status_code != 200:
             raise rag_bad_response(f"上游查询提交异常状态码 {resp.status_code}")
         payload = parse_json_response(resp)
@@ -163,40 +173,55 @@ class RagQueryClient:
 
     @staticmethod
     def _validate_status_payload(payload: dict[str, Any]) -> RagQueryStatus:
-        status = str(payload.get("status") or "")
-        if not status:
+        """严格按上游 QueryTaskStatusResponse 契约校验。
+
+        缺字段允许上游 Pydantic 契约的默认值（status/done_list/running_list 必填，
+        answer/error/trace_id 默认 ""，image_urls/citations 默认 []，
+        terminal_reason_code 默认 None）；但“字段存在且类型错误”必须 RAG_BAD_RESPONSE，
+        禁止用 ``value or []`` 掩盖非法 falsey 类型（如 ""、{}、False、"abc"）。
+        """
+        status = payload.get("status")
+        if not isinstance(status, str) or not status:
             raise rag_bad_response("上游状态响应缺少 status")
         if status not in KNOWN_TASK_STATUSES:
             raise rag_bad_response(f"上游状态未知: {status}")
-        done_list = payload.get("done_list") or []
-        running_list = payload.get("running_list") or []
+
+        done_list = payload.get("done_list")
         if not isinstance(done_list, list) or not all(isinstance(v, str) for v in done_list):
             raise rag_bad_response("上游状态 done_list 结构异常")
+        running_list = payload.get("running_list")
         if not isinstance(running_list, list) or not all(isinstance(v, str) for v in running_list):
             raise rag_bad_response("上游状态 running_list 结构异常")
-        answer = payload.get("answer")
+
+        answer = payload.get("answer", "")
         if not isinstance(answer, str):
             raise rag_bad_response("上游状态 answer 类型异常")
-        error = payload.get("error")
+        error = payload.get("error", "")
         if not isinstance(error, str):
             raise rag_bad_response("上游状态 error 类型异常")
-        citations = payload.get("citations") or []
+        image_urls = payload.get("image_urls", [])
+        if not isinstance(image_urls, list) or not all(isinstance(v, str) for v in image_urls):
+            raise rag_bad_response("上游状态 image_urls 结构异常")
+        trace_id = payload.get("trace_id", "")
+        if not isinstance(trace_id, str):
+            raise rag_bad_response("上游状态 trace_id 类型异常")
+        citations = payload.get("citations", [])
         if not isinstance(citations, list) or not all(isinstance(c, dict) for c in citations):
             raise rag_bad_response("上游状态 citations 结构异常")
+        terminal_reason = payload.get("terminal_reason_code")
+        if terminal_reason is not None and not isinstance(terminal_reason, str):
+            raise rag_bad_response("上游状态 terminal_reason_code 类型异常")
+
         return RagQueryStatus(
             status=status,
             done_list=done_list,
             running_list=running_list,
             answer=answer,
             error=error,
-            image_urls=list(payload.get("image_urls") or []),
-            trace_id=str(payload.get("trace_id") or ""),
+            image_urls=image_urls,
+            trace_id=trace_id,
             citations=citations,
-            terminal_reason_code=(
-                str(payload["terminal_reason_code"])
-                if payload.get("terminal_reason_code") is not None
-                else None
-            ),
+            terminal_reason_code=terminal_reason,
         )
 
     # ---------- GET /stream（SSE，不自动重连）----------

@@ -208,6 +208,9 @@ async def stream_message(
     )
     if not await service.try_acquire_turn(session_id, record):
         raise conflict("该会话正在回答中，请稍后再试")
+    # 标记活跃：并发触达时 recover 不得把执行中的 Turn 当孤儿处理。
+    # 直接改对象（acquire 与赋值之间无 await，无并发窗口）。
+    record.alive = True
     request_id = get_request_id()
 
     async def generate():
@@ -224,9 +227,13 @@ async def stream_message(
             ):
                 yield chunk
         finally:
-            # 正常终态（final/error 已产出）→ 释放；
-            # 客户端断开/异常 → 保留 orphaned，下次触达先查上游 /status 再决定
-            await service.maybe_release_turn(session_id)
+            # 先清除活跃标记（同步赋值，CancelledError 下也必然执行）：
+            # 断开后 Turn 变为可对账的 orphaned；
+            # 再尝试释放——仅 release-safe（已确认上游不再运行）才释放，
+            # 客户端断开/异常/下游 error 但上游未确认 → 保留 orphaned，
+            # 下次触达先查上游 /status 再决定（决策一/二）。
+            record.alive = False
+            await service.maybe_release_turn(session_id, record.turn_id)
 
     return StreamingResponse(
         generate(),

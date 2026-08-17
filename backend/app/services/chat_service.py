@@ -25,6 +25,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from fastapi import BackgroundTasks
@@ -81,14 +82,31 @@ _ALLOWED_RAW_LOCAL_KEYS = ("source_type", "title", "score")
 _ALLOWED_RAW_WEB_KEYS = ("source_type", "title", "score", "source")
 
 
+class TurnPhase(StrEnum):
+    """一次问答在上游生命周期中的阶段（决策：下游交付 ≠ 上游 terminal）。
+
+    - PRE_SUBMIT：尚未开始调用原 RAG POST /query（FAQ lookup 中/提交前）；
+    - SUBMITTING：POST 已开始，但平台尚未确认响应，上游是否接受存在不确定性；
+    - SUBMITTED：已明确确认原 RAG 接受（收到 200 + session_id 一致）；
+    - RELEASE_SAFE：已确认上游 Query 不再运行（可靠上游 final/error，
+      /status=completed|failed，或 404 确认无任务，或从未触达上游）。
+    """
+
+    PRE_SUBMIT = "pre_submit"
+    SUBMITTING = "submitting"
+    SUBMITTED = "submitted"
+    RELEASE_SAFE = "release_safe"
+
+
 @dataclass
 class TurnRecord:
-    """一次进行中问答的必要小状态（registry 只保存这些，terminal 后及时清理）。
+    """一次进行中问答的必要小状态（registry 只保存这些，release-safe 后及时清理）。
 
-    - submitted：已向原 RAG POST /query（上游可能已接受并仍在运行）；
-    - rag_service_user：submit 时使用的上游服务身份，孤儿状态判定 /status 时复用；
-    - terminal：平台已产出 final/error（正常终态）→ 可安全释放；
-      浏览器断开时该标志保持 False，Turn 保留为 orphaned 供下次触达判定。
+    - phase：pre_submit → submitting → submitted → release_safe；
+    - rag_service_user：进入 submitting 时提前保存，孤儿/歧义状态判定 /status 时复用；
+    - recovering：是否正在被某个 recover owner 对账（防并发恢复竞态）；
+    - persisted：本 Turn 终态是否已落库（避免 live error 已落 failed 后，
+      recovery 再次以同一 turn_id 重复写 qa_access_logs）。
     """
 
     session_id: str
@@ -99,19 +117,26 @@ class TurnRecord:
     question_hash: str
     scopes: list[str]
     started_at: float
-    submitted: bool = False
+    phase: TurnPhase = TurnPhase.PRE_SUBMIT
     rag_service_user: str | None = None
-    terminal: bool = False
+    recovering: bool = False
+    persisted: bool = False
+    alive: bool = False  # 本 Turn 的流式 generator 是否仍在活跃执行
 
 
 class ActiveTurnRegistry:
     """进程内按 session_id 的活跃 Turn 注册表（单机单 API worker 假设）。
 
-    - 同 session 同一时间只能有一个进行中问答；
-    - 浏览器断开 ≠ 上游 terminal：断开的 Turn 保留为 orphaned（submitted=True），
-      后续触达先 GET /status 判定后再决定拒绝 / 清理（见 ChatService.recover_orphaned）；
-    - 不引入 Redis 锁 / 分布式锁 / busy 数据库字段；
-    - terminal 后（或 orphaned 被清理后）释放，防止 registry 无限增长。
+    并发/生命周期语义（Stage 4 二次复核决策一/二/三）：
+    - 同 session 同一时间只能有一个进行中问答；只有“能证明旧上游 Query 已不再运行”
+      （release-safe）才允许释放占位并提交下一 Query；
+    - pre_submit 断开：从未触达上游 → 可安全释放，下一问不永久 409；
+    - submitting 网络断开：上游接受与否不确定 → 保留 acceptance-ambiguous 状态，
+      下一问先 /status 对账（pending/processing→409；terminal→收口后释放；
+      无法确认→保守 409）；
+    - 所有关键状态更新都校验 turn_id，禁止旧请求删除/修改后来新建的 Turn；
+    - recover 同一时刻最多一个 owner（recovering 标志），防止重复补齐同一 Turn；
+    - 不引入 Redis 锁 / 分布式锁 / busy 数据库字段。
     """
 
     def __init__(self) -> None:
@@ -140,25 +165,89 @@ class ActiveTurnRegistry:
                 self._records[session_id] = record
                 return True
 
-    async def mark_submitted(self, session_id: str, rag_service_user: str) -> None:
+    async def begin_submitting(self, session_id: str, turn_id: str, rag_service_user: str) -> bool:
+        """pre_submit → submitting（POST 开始前调用，提前保存 service 身份）。
+
+        仅当当前记录仍是本 turn_id 且处于 pre_submit 才生效；否则返回 False。
+        """
         lock = await self._session_lock(session_id)
         async with lock:
             record = self._records.get(session_id)
-            if record is not None:
-                record.submitted = True
-                record.rag_service_user = rag_service_user
+            if record is None or record.turn_id != turn_id or record.phase != TurnPhase.PRE_SUBMIT:
+                return False
+            record.phase = TurnPhase.SUBMITTING
+            record.rag_service_user = rag_service_user
+            return True
 
-    async def mark_terminal(self, session_id: str) -> None:
+    async def mark_submitted(self, session_id: str, turn_id: str) -> bool:
+        """submitting → submitted（POST 已确认接受）。"""
         lock = await self._session_lock(session_id)
         async with lock:
             record = self._records.get(session_id)
-            if record is not None:
-                record.terminal = True
+            if record is None or record.turn_id != turn_id:
+                return False
+            if record.phase == TurnPhase.SUBMITTING:
+                record.phase = TurnPhase.SUBMITTED
+            return True
 
-    async def release(self, session_id: str) -> None:
+    async def mark_persisted(self, session_id: str, turn_id: str) -> None:
+        """记录本 Turn 终态已落库（防 recovery 重复写 qa_access_logs）。"""
         lock = await self._session_lock(session_id)
         async with lock:
+            record = self._records.get(session_id)
+            if record is not None and record.turn_id == turn_id:
+                record.persisted = True
+
+    async def mark_release_safe(self, session_id: str, turn_id: str) -> bool:
+        """标记 release-safe（已确认上游不再运行或从未触达上游）。"""
+        lock = await self._session_lock(session_id)
+        async with lock:
+            record = self._records.get(session_id)
+            if record is None or record.turn_id != turn_id:
+                return False
+            record.phase = TurnPhase.RELEASE_SAFE
+            return True
+
+    async def begin_recover(self, session_id: str, turn_id: str) -> bool:
+        """抢占 recover owner：同一时刻最多一个；返回 False 表示被他人持有/状态不符。"""
+        lock = await self._session_lock(session_id)
+        async with lock:
+            record = self._records.get(session_id)
+            if (
+                record is None
+                or record.turn_id != turn_id
+                or record.recovering
+                or record.phase == TurnPhase.RELEASE_SAFE
+            ):
+                return False
+            record.recovering = True
+            return True
+
+    async def finish_recover(self, session_id: str, turn_id: str, *, release: bool) -> bool:
+        """recover 结束：release=True 释放占位；否则清除 recovering 标记。
+
+        两者都校验 turn_id，防止 stale recover 释放后来新建的 Turn。
+        """
+        lock = await self._session_lock(session_id)
+        async with lock:
+            record = self._records.get(session_id)
+            if record is None or record.turn_id != turn_id:
+                return False
+            if release:
+                self._records.pop(session_id, None)
+            else:
+                record.recovering = False
+            return True
+
+    async def release(self, session_id: str, turn_id: str) -> bool:
+        """按 turn_id 校验后释放；turn_id 不匹配（stale 请求）→ 不删除新 Turn。"""
+        lock = await self._session_lock(session_id)
+        async with lock:
+            record = self._records.get(session_id)
+            if record is None or record.turn_id != turn_id:
+                return False
             self._records.pop(session_id, None)
+            return True
 
     def active_count(self) -> int:
         return len(self._records)
@@ -179,6 +268,18 @@ class TurnOutcome:
     terminal_reason_code: str | None = None
     citations: list[CitationView] = field(default_factory=list)
     error_code: str | None = None
+
+
+@dataclass
+class StatusFallback:
+    """/status 兜底判定结果（区分“可收口”与“仅可报错”）。"""
+
+    kind: str  # "terminal"（final 收口）| "failed"（error+release-safe）| "unknown"（error+保留）
+
+    answer: str = ""
+    trace_id: str | None = None
+    citations: list[dict[str, Any]] = field(default_factory=list)
+    terminal_reason_code: str | None = None
 
 
 def to_citation_view(raw: dict[str, Any]) -> CitationView:
@@ -399,41 +500,95 @@ class ChatService:
     async def try_acquire_turn(self, session_id: str, record: TurnRecord) -> bool:
         return await _active_turns.try_acquire(session_id, record)
 
-    async def maybe_release_turn(self, session_id: str) -> None:
-        """终态（final/error 已产出）→ 释放；否则保留 orphaned 供下次触达判定。"""
-        record = await _active_turns.get(session_id)
-        if record is not None and record.terminal:
-            await _active_turns.release(session_id)
+    async def maybe_release_turn(self, session_id: str, turn_id: str) -> None:
+        """路由 finally：仅 release-safe（已确认上游不再运行）才释放。
 
-    async def recover_orphaned(self, session_id: str, user_id: str) -> None:
-        """上一轮断开但未确认 terminal：先查上游 /status 判定。
-
-        - pending/processing → 409（旧 Query 仍在跑，禁止重叠）；
-        - completed（完整）→ 尽力补齐旧 Turn 终态持久化后清理，允许新 Query；
-        - failed → 清理（补齐失败态），允许新 Query；
-        - 无法确认 / RAG 不可用 → 保守拒绝（409），不提交新 /query。
+        客户端断开/异常 → 不满足 → 保留 orphaned 供下次触达判定；
+        校验 turn_id，禁止 stale finally 删除后来新建的 Turn。
         """
         record = await _active_turns.get(session_id)
-        if record is None or record.terminal:
+        if (
+            record is not None
+            and record.turn_id == turn_id
+            and record.phase == TurnPhase.RELEASE_SAFE
+        ):
+            await _active_turns.release(session_id, turn_id)
+
+    async def recover_orphaned(self, session_id: str, user_id: str) -> None:
+        """上一轮断开/歧义但未确认上游 terminal：先查上游 /status 判定。
+
+        - 无记录 / release-safe / pre_submit（从未触达上游）→ 安全释放，允许新 Query；
+        - /status=404（上游确认无该 session 任务）→ 旧 Query 已不在运行 → 释放；
+        - /status=pending|processing → 409（旧 Query 仍在跑，禁止重叠）；
+        - /status=completed（trace_id+answer 完整）→ 补齐旧 Turn 终态后释放；
+          completed 但字段不完整：已落库则释放，否则保守 409（不静默释放）；
+        - /status=failed → 补齐失败态后释放；
+        - /status 网络错误/无法确认 → 保守 409，不提交新 /query。
+
+        并发安全：begin_recover 抢占唯一 owner；被抢占者直接 409；
+        所有关键更新（finish_recover/release）校验 turn_id。
+        """
+        record = await _active_turns.get(session_id)
+        if record is None:
             return
-        if not record.submitted:
-            raise conflict("该会话正在处理中，请稍后再试")
+        if record.alive:
+            # 上一轮 Turn 仍在活跃执行（并发触达同一 session）：不触碰，保守 409
+            raise conflict("该会话正在回答中，请稍后再试")
+        if record.phase == TurnPhase.RELEASE_SAFE:
+            await _active_turns.release(session_id, record.turn_id)
+            return
+        if record.phase == TurnPhase.PRE_SUBMIT:
+            # 从未触达上游：没有上游 Query，安全释放，下一问可继续
+            await _active_turns.release(session_id, record.turn_id)
+            return
+        # SUBMITTING / SUBMITTED：需要与上游对账（单 owner 防并发恢复竞态）
+        if not await _active_turns.begin_recover(session_id, record.turn_id):
+            raise conflict("上一轮问答正在确认中，请稍后再试")
         try:
-            status = await self.query_client.get_status(
-                session_id, service_user=record.rag_service_user or ""
-            )
-        except RagError:
-            raise conflict("上一轮问答状态无法确认，请稍后重试") from None
-        if status is None:
+            try:
+                status = await self.query_client.get_status(
+                    session_id, service_user=record.rag_service_user or ""
+                )
+            except RagError:
+                # 无法确认 → 保守 409；清除 recovering 供下次重试
+                await _active_turns.finish_recover(session_id, record.turn_id, release=False)
+                raise conflict("上一轮问答状态无法确认，请稍后重试") from None
+            if status is None:
+                # /status=404：上游确认无该 session 任务 → 旧 Query 已不在运行；
+                # 未落库时补齐失败态（本轮问答未能完成），随后释放允许下一问
+                if not record.persisted:
+                    await self._recover_failed(record)
+                await _active_turns.finish_recover(session_id, record.turn_id, release=True)
+                return
+            if status.status in ("pending", "processing"):
+                await _active_turns.finish_recover(session_id, record.turn_id, release=False)
+                raise conflict("该会话仍在处理上一轮问答，请稍后再试")
+            if status.status == "completed":
+                if status.trace_id and status.answer:
+                    if not record.persisted:
+                        await self._recover_terminal(record, status)
+                    await _active_turns.finish_recover(session_id, record.turn_id, release=True)
+                elif record.persisted:
+                    # 已落库（live error 已交付）→ 无需补齐，释放
+                    await _active_turns.finish_recover(session_id, record.turn_id, release=True)
+                else:
+                    # completed 但终态字段不完整且未落库：无法安全补齐 → 保守 409
+                    await _active_turns.finish_recover(session_id, record.turn_id, release=False)
+                    raise conflict("上一轮问答结果不完整，请稍后重试")
+                return
+            if status.status == "failed":
+                if not record.persisted:
+                    await self._recover_failed(record)
+                await _active_turns.finish_recover(session_id, record.turn_id, release=True)
+                return
+            # 未知状态已由 Adapter 契约校验拒绝（RAG_BAD_RESPONSE），走 except
+            await _active_turns.finish_recover(session_id, record.turn_id, release=False)
             raise conflict("上一轮问答状态无法确认，请稍后重试")
-        if status.status in ("pending", "processing"):
-            raise conflict("该会话仍在处理上一轮问答，请稍后再试")
-        # completed / failed：清理旧 active 状态后才允许下一问
-        if status.status == "completed" and status.trace_id and status.answer:
-            await self._recover_terminal(record, status)
-        elif status.status == "failed":
-            await self._recover_failed(record)
-        await _active_turns.release(session_id)
+        except Exception:  # noqa: BLE001
+            # 未预期异常：确保不残留 recovering 锁死后续触达（conflict 路径已在
+            # 抛出前 finish_recover(release=False)，此处只兜底未预期异常）
+            await _active_turns.finish_recover(session_id, record.turn_id, release=False)
+            raise
 
     async def _recover_terminal(self, record: TurnRecord, status) -> None:
         """尽力补齐断开 Turn 的终态持久化（上游已 completed 且完整）。"""
@@ -494,8 +649,10 @@ class ChatService:
     ) -> AsyncIterator[str]:
         """平台 SSE 事件流（调用方负责 acquire / orphaned 保留与终态标记）。
 
-        正常终态（final/error 已产出）→ 内部 mark_terminal，route finally 释放；
-        客户端断开（CancelledError 传播）→ 不标记，Turn 保留为 orphaned 供下次判定。
+        - 可靠确认上游不再运行（上游 final/error、/status=completed/failed、
+          404 无任务，或从未触达上游）→ 内部 mark_release_safe，route finally 释放；
+        - 客户端断开 / 网络断流 / 下游 error 但上游仍在运行 → 不标记，
+          Turn 保留为 orphaned/submitting，下次触达先 /status 对账（决策一/二）。
         """
         turn_id = record.turn_id
         session_id = chat_session.id
@@ -540,7 +697,9 @@ class ChatService:
                 await self.faq_service.record_hit(faq_hit.faq_id)
             except Exception:  # noqa: BLE001 命中计数失败不影响已交付答案
                 logger.warning("FAQ hit_count 自增失败 faq_id=%s", faq_hit.faq_id)
-            await _active_turns.mark_terminal(session_id)
+            await _active_turns.mark_persisted(session_id, turn_id)
+            # FAQ 从未触达上游 → release-safe
+            await _active_turns.mark_release_safe(session_id, turn_id)
             yield _final_sse(request_id, turn_id, outcome)
             return
 
@@ -548,6 +707,10 @@ class ChatService:
         rag_service_user = service_user_for_role(user.role)
         dataset_ids = dataset_ids_for_role(user.role)
         yield _progress(request_id, turn_id, STAGE_RAG_SUBMIT, "正在提交知识检索")
+        # POST 开始前进入 submitting 并提前保存 service 身份：若提交发生网络
+        # timeout/connection，上游是否已接受存在不确定性（acceptance-ambiguous），
+        # 平台必须保留该状态，由下一次触达先 /status 对账。
+        await _active_turns.begin_submitting(session_id, turn_id, rag_service_user)
         try:
             await self.query_client.submit_query(
                 query=question,
@@ -555,9 +718,8 @@ class ChatService:
                 dataset_ids=dataset_ids,
                 service_user=rag_service_user,
             )
-            # 上游已接受（可能仍在后台运行）：记录 submitted + service identity，
-            # 供浏览器断开后的 orphaned 判定 /status 复用同一身份。
-            await _active_turns.mark_submitted(session_id, rag_service_user)
+            # 已明确确认上游接受（200 + session_id 一致）
+            await _active_turns.mark_submitted(session_id, turn_id)
         except RagError as exc:
             outcome = TurnOutcome(success=False, error_code=_safe_rag_error_code(exc))
             await self._persist_turn(
@@ -571,7 +733,14 @@ class ChatService:
                 outcome=outcome,
                 started_at=started_at,
             )
-            await _active_turns.mark_terminal(session_id)
+            await _active_turns.mark_persisted(session_id, turn_id)
+            if getattr(exc, "acceptance_ambiguous", False):
+                # 网络超时/断链/网关超时：上游是否接受不确定 → 不 release-safe，
+                # 保留 acceptance-ambiguous 状态；下一问先 /status 对账
+                logger.info("submit 接受性歧义 turn_id=%s code=%s", turn_id, outcome.error_code)
+            else:
+                # 上游明确拒绝（非 2xx / 契约错误）：未产生上游任务 → release-safe
+                await _active_turns.mark_release_safe(session_id, turn_id)
             yield _error_sse(request_id, turn_id, outcome.error_code)
             return
 
@@ -584,6 +753,10 @@ class ChatService:
         error_code: str | None = None
         stream_error_code: str | None = None
         saw_terminal = False
+        # 上游 terminal 是否已被“可靠”确认（上游 final/error、/status=completed/failed、
+        # 或 404 确认无任务）。只有 release-safe 才允许释放 registry 提交下一 Query；
+        # 仅“下游已向浏览器交付 error”不算（决策一）。
+        upstream_release_safe = False
 
         try:
             async for event, data in self.query_client.stream_events(
@@ -628,23 +801,27 @@ class ChatService:
                     citations_raw = citations_payload
                     terminal_reason = terminal_raw
                     saw_terminal = True
+                    upstream_release_safe = True  # 上游自身宣告 final = 可靠 terminal
                     break
                 elif event == EV_ERROR:
-                    # 上游显式 error：不直接透传上游异常字符串
+                    # 上游显式 error：不直接透传上游异常字符串；上游自身宣告终态
                     error_code = ERR_RAG_BAD_RESPONSE
                     saw_terminal = True
+                    upstream_release_safe = True
                     break
                 else:
                     continue  # 未知事件：不破坏流
         except RagError as exc:
             # 网络断流（timeout/connection）或契约异常：不直接定为失败，
-            # 先有限 GET /status 兜底（任务书决策 3）
+            # 先有限 GET /status 兜底（任务书决策 3）；是否 release-safe 由 /status 决定
             stream_error_code = _safe_rag_error_code(exc)
             saw_terminal = False
+            upstream_release_safe = False
         except Exception:  # noqa: BLE001 未预期异常：连接不截断，走稳定错误
             logger.exception("RAG 流式处理异常 session=%s", session_id)
             stream_error_code = ERR_RAG_BAD_RESPONSE
             saw_terminal = False
+            upstream_release_safe = False
 
         # 未观察到明确 final/error（自然 EOF / 网络断流 / 契约异常）→ 有限兜底查 /status
         if not saw_terminal and error_code is None:
@@ -652,12 +829,19 @@ class ChatService:
             fallback = await self._fallback_to_status(session_id, rag_service_user)
             if fallback is None:
                 error_code = stream_error_code or ERR_RAG_BAD_RESPONSE
-            else:
-                answer_parts = [fallback["answer"]] if fallback["answer"] else answer_parts
-                trace_id = fallback["trace_id"]
-                citations_raw = fallback["citations"]
-                terminal_reason = fallback["terminal_reason_code"]
+                upstream_release_safe = False
+            elif fallback.kind == "terminal":
+                answer_parts = [fallback.answer] if fallback.answer else answer_parts
+                trace_id = fallback.trace_id
+                citations_raw = fallback.citations
+                terminal_reason = fallback.terminal_reason_code
                 saw_terminal = True
+                upstream_release_safe = True
+            else:
+                # failed / absent（404 确认无任务）→ error + release-safe；
+                # unknown（pending/processing/无法确认）→ error + 保留占位
+                error_code = stream_error_code or ERR_RAG_BAD_RESPONSE
+                upstream_release_safe = fallback.kind != "unknown"
 
         success = saw_terminal and error_code is None
         outcome = TurnOutcome(
@@ -680,7 +864,9 @@ class ChatService:
             outcome=outcome,
             started_at=started_at,
         )
-        await _active_turns.mark_terminal(session_id)
+        await _active_turns.mark_persisted(session_id, turn_id)
+        if upstream_release_safe:
+            await _active_turns.mark_release_safe(session_id, turn_id)
 
         if outcome.success:
             yield _final_sse(request_id, turn_id, outcome)
@@ -698,30 +884,40 @@ class ChatService:
 
     async def _fallback_to_status(
         self, session_id: str, rag_service_user: str
-    ) -> dict[str, Any] | None:
-        """SSE 异常断开后的有限兜底：返回终态事实 dict 或 None（表示无法确认）。
+    ) -> StatusFallback | None:
+        """SSE 异常断开后的有限兜底：基于 /status 判定终态事实。
 
-        - status completed 且完整（answer + trace_id）→ 以终态收口；
-        - status failed / 无法确认终态 → None（绝不伪成功）。
+        返回：
+        - StatusFallback(kind="terminal", ...) → 可 final 收口（completed 且完整）；
+        - StatusFallback(kind="failed") → 上游已 failed，error + release-safe；
+        - StatusFallback(kind="absent") → /status=404，上游确认无任务，error + release-safe；
+        - StatusFallback(kind="unknown") → pending/processing/completed 不完整/无法确认，
+          error + 保留占位（下一问先 /status 对账）；
+        - None → /status 调用失败（网络错误/契约错误），无法确认。
         """
         try:
             status = await self.query_client.get_status(session_id, service_user=rag_service_user)
         except RagError:
             return None
         if status is None:
-            return None
+            # 404：上游确认无该 session 任务 → 旧 Query 已不在运行（无内容可收口）
+            return StatusFallback(kind="absent")
         if status.status == "completed":
             trace_id = str(status.trace_id or "").strip()
             if trace_id and status.answer:
-                return {
-                    "answer": status.answer,
-                    "trace_id": trace_id or None,
-                    "citations": list(status.citations),
-                    "terminal_reason_code": status.terminal_reason_code,
-                }
-            return None
-        # failed / pending / processing：无法确认终态
-        return None
+                return StatusFallback(
+                    kind="terminal",
+                    answer=status.answer,
+                    trace_id=trace_id or None,
+                    citations=list(status.citations),
+                    terminal_reason_code=status.terminal_reason_code,
+                )
+            # completed 但终态字段不完整：无法安全收口 → 保守 unknown
+            return StatusFallback(kind="unknown")
+        if status.status == "failed":
+            return StatusFallback(kind="failed")
+        # pending / processing：上游仍在运行
+        return StatusFallback(kind="unknown")
 
     # ---------- 持久化 ----------
 

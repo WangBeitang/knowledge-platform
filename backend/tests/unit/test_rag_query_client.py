@@ -282,3 +282,149 @@ class TestContractTightening:
             assert exc_info.value.code == "RAG_BAD_RESPONSE"
         finally:
             await c.aclose()
+
+
+class TestStatusStrictTypeValidation:
+    """决策六：status Adapter 严格类型校验——禁止 value or [] 掩盖非法 falsey 类型。"""
+
+    @pytest.mark.asyncio
+    async def test_done_list_empty_string_is_bad_response(self, fake):
+        fake.seed_status("s1", {"status": "completed", "done_list": "", "running_list": []})
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_running_list_empty_dict_is_bad_response(self, fake):
+        fake.seed_status("s1", {"status": "processing", "done_list": [], "running_list": {}})
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_citations_false_is_bad_response(self, fake):
+        fake.seed_status(
+            "s1", {"status": "completed", "done_list": [], "running_list": [], "citations": False}
+        )
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_image_urls_string_is_bad_response(self, fake):
+        fake.seed_status(
+            "s1", {"status": "completed", "done_list": [], "running_list": [], "image_urls": "abc"}
+        )
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_trace_id_int_is_bad_response(self, fake):
+        fake.seed_status(
+            "s1", {"status": "completed", "done_list": [], "running_list": [], "trace_id": 123}
+        )
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_terminal_reason_code_dict_is_bad_response(self, fake):
+        fake.seed_status(
+            "s1",
+            {
+                "status": "completed",
+                "done_list": [],
+                "running_list": [],
+                "terminal_reason_code": {},
+            },
+        )
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_answer_int_is_bad_response(self, fake):
+        fake.seed_status(
+            "s1", {"status": "completed", "done_list": [], "running_list": [], "answer": 1}
+        )
+        c = _client(fake)
+        try:
+            with pytest.raises(RagError) as exc_info:
+                await c.get_status("s1", service_user="u")
+            assert exc_info.value.code == "RAG_BAD_RESPONSE"
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_normal_empty_lists_and_strings_are_valid(self, fake):
+        """正常空 list / 空 str / None 必须仍合法（按上游契约默认值处理）。"""
+        fake.seed_status(
+            "s1",
+            {
+                "status": "processing",
+                "done_list": [],
+                "running_list": [],
+                "answer": "",
+                "error": "",
+                "image_urls": [],
+                "trace_id": "",
+                "citations": [],
+                "terminal_reason_code": None,
+            },
+        )
+        c = _client(fake)
+        try:
+            status = await c.get_status("s1", service_user="u")
+            assert status is not None
+            assert status.status == "processing"
+            assert status.done_list == []
+            assert status.running_list == []
+            assert status.answer == ""
+            assert status.image_urls == []
+            assert status.trace_id == ""
+            assert status.citations == []
+            assert status.terminal_reason_code is None
+        finally:
+            await c.aclose()
+
+    @pytest.mark.asyncio
+    async def test_missing_optional_fields_default_to_contract_defaults(self, fake):
+        """缺字段（非非法类型）→ 按上游 Pydantic 契约默认值，不报错。"""
+        fake.seed_status("s1", {"status": "completed", "done_list": [], "running_list": []})
+        c = _client(fake)
+        try:
+            status = await c.get_status("s1", service_user="u")
+            assert status is not None
+            assert status.answer == ""
+            assert status.error == ""
+            assert status.image_urls == []
+            assert status.trace_id == ""
+            assert status.citations == []
+            assert status.terminal_reason_code is None
+        finally:
+            await c.aclose()

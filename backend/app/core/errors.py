@@ -24,6 +24,7 @@ class AppError(Exception):
         status_code: int = 400,
         retryable: bool = False,
         details: dict[str, Any] | None = None,
+        acceptance_ambiguous: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -31,6 +32,9 @@ class AppError(Exception):
         self.status_code = status_code
         self.retryable = retryable
         self.details = details or {}
+        # 网络层不确定（timeout/connection）：调用方无法判断上游是否已接受请求。
+        # 仅当为 True 时，平台必须保留 acceptance-ambiguous 状态，禁止直接释放。
+        self.acceptance_ambiguous = acceptance_ambiguous
 
 
 # ---- 常用错误快捷构造 ----

@@ -33,7 +33,9 @@ class FakeQueryRag:
         self.statuses: dict[str, dict] = {}
         self.traces: dict[str, dict] = {}
         self.stream_delay: float = 0.0
+        self.status_delay: float = 0.0  # /status 响应延迟（用于并发恢复竞态测试）
         self.fail_submit: str | None = None  # "unavailable" | "timeout" | "bad"
+        self.submit_network_error: bool = False  # POST /query 连接层断链（接受性歧义）
         self.drop_stream: bool = False  # 流结束但无终态
         self.stream_network_error: bool = False  # 流式连接抛网络错误（模拟 socket 断流）
         self.submit_session_id_override: str | None = (
@@ -84,7 +86,7 @@ class FakeQueryRag:
         if method == "GET" and len(parts) == 2 and parts[0] == "stream":
             return await self._handle_stream(parts[1])
         if method == "GET" and len(parts) == 2 and parts[0] == "status":
-            return self._handle_status(parts[1])
+            return await self._handle_status(parts[1])
         if method == "GET" and len(parts) == 2 and parts[0] == "traces":
             return self._handle_trace(parts[1])
         return httpx.Response(404, json={"detail": "not found"})
@@ -106,6 +108,9 @@ class FakeQueryRag:
             return httpx.Response(504, json={"detail": "upstream timeout"})
         if self.fail_submit == "bad":
             return httpx.Response(200, content=b"<html>not json</html>")
+        if self.submit_network_error:
+            # 连接层断链：上游是否已接受本请求存在不确定性（acceptance-ambiguous）
+            raise httpx.ConnectError("simulated submit socket error", request=request)
         returned_session_id = self.submit_session_id_override or body.get("session_id")
         return httpx.Response(
             200, json={"message": "查询任务已开始", "session_id": returned_session_id}
@@ -121,8 +126,10 @@ class FakeQueryRag:
         body = "".join(_sse_pack(event, data) for event, data in events)
         return httpx.Response(200, content=body, headers=SSE_HEADERS)
 
-    def _handle_status(self, session_id: str) -> httpx.Response:
+    async def _handle_status(self, session_id: str) -> httpx.Response:
         self.status_calls.append(session_id)
+        if self.status_delay > 0:
+            await asyncio.sleep(self.status_delay)
         status = self.statuses.get(session_id)
         if status is None:
             return httpx.Response(404, json={"detail": f"session {session_id} 不存在"})

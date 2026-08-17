@@ -511,7 +511,7 @@ class TestRagStream:
         直接向进程内 registry 构造 orphaned 状态，稳定验证 recover 判定逻辑
         （不依赖 ASGITransport 的断开语义）。
         """
-        from app.services.chat_service import TurnRecord, _active_turns
+        from app.services.chat_service import TurnPhase, TurnRecord, _active_turns
 
         fake = chat_rag_factory(FakeQueryRag(), db_session)
         _, token = await _make_employee(db_session, tracked_users, client)
@@ -530,7 +530,7 @@ class TestRagStream:
             question_hash="h" * 64,
             scopes=["internal_shared", "external_public"],
             started_at=0.0,
-            submitted=True,
+            phase=TurnPhase.SUBMITTED,
             rag_service_user="svc_knowledge_employee",
         )
         assert await _active_turns.try_acquire(session_id, orphan)
@@ -544,13 +544,13 @@ class TestRagStream:
             assert resp.json()["error"]["code"] == "RESOURCE_CONFLICT"
             assert len(fake.query_calls) == 0  # 未提交新 /query（不重叠）
         finally:
-            await _active_turns.release(session_id)
+            await _active_turns.release(session_id, "orphan-turn-1")
 
     async def test_orphaned_terminal_second_ask_recovers_and_succeeds(
         self, client, db_session, tracked_users, chat_rag_factory
     ):
         """孤儿 Turn 上游已 completed → 清理旧状态、补齐旧 Turn 终态，第二问成功。"""
-        from app.services.chat_service import TurnRecord, _active_turns
+        from app.services.chat_service import TurnPhase, TurnRecord, _active_turns
 
         fake = chat_rag_factory(FakeQueryRag(), db_session)
         user_id, token = await _make_employee(db_session, tracked_users, client)
@@ -578,7 +578,7 @@ class TestRagStream:
             question_hash="h" * 64,
             scopes=["internal_shared", "external_public"],
             started_at=0.0,
-            submitted=True,
+            phase=TurnPhase.SUBMITTED,
             rag_service_user="svc_knowledge_employee",
         )
         assert await _active_turns.try_acquire(session_id, orphan)
@@ -620,7 +620,7 @@ class TestRagStream:
             assert recovered_log.answer_source == "rag"
             assert recovered_log.citation_count == 1
         finally:
-            await _active_turns.release(session_id)
+            await _active_turns.release(session_id, "orphan-turn-2")
 
     async def test_error_terminal_no_extra_events(
         self, client, db_session, tracked_users, chat_rag_factory
@@ -712,7 +712,17 @@ class TestStreamFallbackAndContract:
     async def test_stream_socket_error_status_processing_yields_error(
         self, client, db_session, tracked_users, chat_rag_factory
     ):
-        """stream socket 报错且 /status 仍 processing → 稳定 error，绝不伪成功。"""
+        """stream socket 报错且 /status 仍 processing → 当前 error，但 registry 必须保留。
+
+        验收（决策一/三）：
+        1. 当前请求得到稳定 SSE error（不伪成功）；
+        2. registry 仍保留旧上游 Query（下游 error ≠ 上游 terminal）；
+        3. 紧接着同 Session 第二问返回 409；
+        4. fake RAG 没有收到第二次 /query；
+        5. 将旧 Query status 改为 completed 后，再发问可恢复并继续。
+        """
+        from app.services.chat_service import TurnPhase, _active_turns
+
         fake = chat_rag_factory(FakeQueryRag(), db_session)
         _, token = await _make_employee(db_session, tracked_users, client)
         session_id = await _create_session(client, token)
@@ -730,11 +740,53 @@ class TestStreamFallbackAndContract:
         assert resp.status_code == 200
         events = parse_sse(resp.text)
         names = [name for name, _ in events]
+        # 1. 稳定 error
         assert names[-1] == "error"
         assert "final" not in names
         assert events[-1][1]["code"] == "RAG_UNAVAILABLE"  # 连接层错误 → RAG_UNAVAILABLE
         messages = await _messages_of(db_session, session_id)
         assert messages[1].status == "failed"
+
+        # 2. registry 保留旧上游 Query（processing 未 terminal，不释放）
+        record = await _active_turns.get(session_id)
+        assert record is not None
+        assert record.phase in (TurnPhase.SUBMITTED, TurnPhase.SUBMITTING)
+
+        # 3+4. 第二问 409，且不提交新 /query
+        resp2 = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "第二问"},
+        )
+        assert resp2.status_code == 409
+        assert resp2.json()["error"]["code"] == "RESOURCE_CONFLICT"
+        assert len(fake.query_calls) == 1  # 只有第一问的 /query
+
+        # 5. 旧 Query terminal（completed）后 → recover 收口，第三问成功
+        fake.seed_status(
+            session_id,
+            {
+                "status": "completed",
+                "done_list": ["node_answer_output"],
+                "running_list": [],
+                "answer": "上游最终完成",
+                "error": "",
+                "image_urls": [],
+                "trace_id": "trace-late-complete",
+                "citations": [LOCAL_CITATION],
+                "terminal_reason_code": "completed",
+            },
+        )
+        fake.stream_network_error = False
+        fake.seed_stream(session_id, _rag_stream_events())
+        resp3 = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "第三问"},
+        )
+        assert resp3.status_code == 200
+        assert parse_sse(resp3.text)[-1][0] == "final"
+        assert len(fake.query_calls) == 2  # 第三问才提交第二个 /query
 
     async def test_malformed_final_missing_trace_id_yields_error(
         self, client, db_session, tracked_users, chat_rag_factory
@@ -831,3 +883,301 @@ class TestStreamFallbackAndContract:
         assert events[-1][1]["code"] == "RAG_BAD_RESPONSE"
         messages = await _messages_of(db_session, session_id)
         assert messages[1].status == "failed"
+
+
+class TestTurnLifecycleReview2:
+    """Stage 4 二次复核：Turn 生命周期（决策一/二/三）。
+
+    直接向进程内 registry 构造状态，稳定验证生命周期语义（不依赖
+    ASGITransport 的真实断开语义）。
+    """
+
+    async def test_pre_submit_disconnect_next_ask_ok(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """pre_submit 断开（从未触达上游）→ 安全释放，下一问不永久 409。"""
+        from app.services.chat_service import TurnPhase, TurnRecord, _active_turns
+
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        # 构造 pre_submit 状态（FAQ lookup 中/提交前断开）
+        orphan = TurnRecord(
+            session_id=session_id,
+            user_id=tracked_users[-1],
+            turn_id="pre-submit-turn",
+            question="旧问题",
+            normalized="旧问题",
+            question_hash="h" * 64,
+            scopes=["internal_shared", "external_public"],
+            started_at=0.0,
+            phase=TurnPhase.PRE_SUBMIT,
+        )
+        assert await _active_turns.try_acquire(session_id, orphan)
+        try:
+            # 下一问：recover 直接释放 pre_submit，不再 /status 对账，允许新 Query
+            fake.seed_stream(session_id, _rag_stream_events())
+            resp = await client.post(
+                SSE_STREAM_PATH.format(sid=session_id),
+                headers=await bearer_headers(token),
+                json={"question": "新问题"},
+            )
+            assert resp.status_code == 200
+            assert parse_sse(resp.text)[-1][0] == "final"
+            assert len(fake.query_calls) == 1  # 只提交了这一次 /query
+            # registry 最终无残留
+            assert await _active_turns.get(session_id) is None
+        finally:
+            await _active_turns.release(session_id, "pre-submit-turn")
+
+    async def test_submitting_network_error_processing_second_ask_409(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """submitting 网络断链（接受性歧义）+ status processing → 下一问 409。"""
+        from app.services.chat_service import TurnPhase, _active_turns
+
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.submit_network_error = True  # POST 连接层断链 → acceptance-ambiguous
+        fake.seed_status(
+            session_id,
+            {"status": "processing", "done_list": [], "running_list": ["node_rerank"]},
+        )
+        resp = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "第一问"},
+        )
+        assert resp.status_code == 200
+        events = parse_sse(resp.text)
+        assert events[-1][0] == "error"
+        assert events[-1][1]["code"] == "RAG_UNAVAILABLE"
+
+        # 歧义状态保留：不能把 submitted=False 一律释放
+        record = await _active_turns.get(session_id)
+        assert record is not None
+        assert record.phase == TurnPhase.SUBMITTING
+
+        # 第二问：/status 对账 → processing → 409，不提交新 /query
+        resp2 = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "第二问"},
+        )
+        assert resp2.status_code == 409
+        assert len(fake.query_calls) == 1  # 只有第一问的 /query（虽然网络断链）
+
+        # 旧 Query terminal 后 → recover 收口，第三问成功
+        fake.seed_status(
+            session_id,
+            {
+                "status": "completed",
+                "done_list": ["node_answer_output"],
+                "running_list": [],
+                "answer": "对账后确认完成",
+                "error": "",
+                "image_urls": [],
+                "trace_id": "trace-submitting-recover",
+                "citations": [LOCAL_CITATION],
+                "terminal_reason_code": "completed",
+            },
+        )
+        fake.submit_network_error = False
+        fake.seed_stream(session_id, _rag_stream_events())
+        resp3 = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "第三问"},
+        )
+        assert resp3.status_code == 200
+        assert parse_sse(resp3.text)[-1][0] == "final"
+        assert len(fake.query_calls) == 2
+
+    async def test_stream_natural_eof_status_processing_second_ask_409(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """自然 EOF 无终态 + /status processing（代表场景）→ 当前 error，下一问 409。"""
+        from app.services.chat_service import TurnPhase, _active_turns
+
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_stream(session_id, [("ready", {}), ("delta", {"delta": "部"})])  # 无终态 EOF
+        fake.seed_status(
+            session_id,
+            {"status": "processing", "done_list": [], "running_list": ["node_rerank"]},
+        )
+        resp = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "如何办理风险测评？"},
+        )
+        assert resp.status_code == 200
+        events = parse_sse(resp.text)
+        assert events[-1][0] == "error"
+        assert events[-1][1]["code"] == "RAG_BAD_RESPONSE"
+
+        record = await _active_turns.get(session_id)
+        assert record is not None
+        assert record.phase == TurnPhase.SUBMITTED
+
+        resp2 = await client.post(
+            SSE_STREAM_PATH.format(sid=session_id),
+            headers=await bearer_headers(token),
+            json={"question": "第二问"},
+        )
+        assert resp2.status_code == 409
+        assert len(fake.query_calls) == 1
+
+    async def test_concurrent_recovery_single_owner_no_dup(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """两个并发 recovery：只能有一个 owner，无重复持久化旧 Turn、无两个新 /query。
+
+        - 旧 Turn 恰好补一条 qa_access_log（turn_id 唯一）；
+        - 只有一个请求成功（200 final），另一个 409；
+        - registry 最终无残留（stale release 不得删新 Turn）。
+        """
+        import asyncio
+
+        from app.services.chat_service import TurnPhase, TurnRecord, _active_turns
+
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_status(
+            session_id,
+            {
+                "status": "completed",
+                "done_list": ["node_answer_output"],
+                "running_list": [],
+                "answer": "并发恢复的旧答案",
+                "error": "",
+                "image_urls": [],
+                "trace_id": "trace-concurrent-recover",
+                "citations": [LOCAL_CITATION],
+                "terminal_reason_code": "completed",
+            },
+        )
+        fake.status_delay = 0.3  # 让第一个 recover 的 /status 慢响应，制造竞态窗口
+        orphan = TurnRecord(
+            session_id=session_id,
+            user_id=tracked_users[-1],
+            turn_id="orphan-concurrent",
+            question="旧问题",
+            normalized="旧问题",
+            question_hash="h" * 64,
+            scopes=["internal_shared", "external_public"],
+            started_at=0.0,
+            phase=TurnPhase.SUBMITTED,
+            rag_service_user="svc_knowledge_employee",
+        )
+        assert await _active_turns.try_acquire(session_id, orphan)
+        try:
+            fake.seed_stream(session_id, _rag_stream_events())
+            # 两个“并发”请求：第一个进入 recover 的 /status await（status_delay 挂起），
+            # 第二个在这段时间内触达 recover → 被单 owner 保护拒绝（409）。
+            # 共享 AsyncSession 不支持真正并发 DB 访问，用 create_task + sleep 制造
+            # recover 重叠窗口（DB 访问仍按序执行）。
+            task1 = asyncio.create_task(
+                client.post(
+                    SSE_STREAM_PATH.format(sid=session_id),
+                    headers=await bearer_headers(token),
+                    json={"question": "并发一"},
+                )
+            )
+            await asyncio.sleep(0.15)  # task1 已 begin_recover 并挂起在 /status
+            resp2 = await client.post(
+                SSE_STREAM_PATH.format(sid=session_id),
+                headers=await bearer_headers(token),
+                json={"question": "并发二"},
+            )
+            resp1 = await task1
+            statuses = sorted([resp1.status_code, resp2.status_code])
+            assert statuses == [200, 409]  # 一个成功、一个被 recover 竞争拒绝
+
+            messages = await _messages_of(db_session, session_id)
+            # 旧 Turn（2）+ 一个成功的新 Turn（2）= 4
+            assert len(messages) == 4
+            assert messages[1].content == "并发恢复的旧答案"
+            assert messages[1].rag_trace_id == "trace-concurrent-recover"
+
+            logs = list(
+                (
+                    await db_session.scalars(
+                        select(QaAccessLog).where(QaAccessLog.session_id == session_id)
+                    )
+                ).all()
+            )
+            # 旧 Turn 恰好一条日志（turn_id 唯一，无重复持久化）+ 新 Turn 一条
+            assert len(logs) == 2
+            old_logs = [log for log in logs if log.turn_id == "orphan-concurrent"]
+            assert len(old_logs) == 1
+            assert old_logs[0].status == "succeeded"
+
+            assert len(fake.query_calls) == 1  # 只有一个新 /query
+            assert await _active_turns.get(session_id) is None  # 无残留
+        finally:
+            await _active_turns.release(session_id, "orphan-concurrent")
+
+    async def test_recover_completed_incomplete_fields_conservative_409(
+        self, client, db_session, tracked_users, chat_rag_factory
+    ):
+        """completed 但终态字段不完整（缺 trace_id/answer）→ 保守 409，不静默释放。"""
+        from app.services.chat_service import TurnPhase, TurnRecord, _active_turns
+
+        fake = chat_rag_factory(FakeQueryRag(), db_session)
+        _, token = await _make_employee(db_session, tracked_users, client)
+        session_id = await _create_session(client, token)
+        fake.seed_status(
+            session_id,
+            {
+                "status": "completed",
+                "done_list": ["node_answer_output"],
+                "running_list": [],
+                "answer": "",
+                "error": "",
+                "image_urls": [],
+                "trace_id": "",
+                "citations": [],
+                "terminal_reason_code": "completed",
+            },
+        )
+        orphan = TurnRecord(
+            session_id=session_id,
+            user_id=tracked_users[-1],
+            turn_id="orphan-incomplete",
+            question="旧问题",
+            normalized="旧问题",
+            question_hash="h" * 64,
+            scopes=["internal_shared", "external_public"],
+            started_at=0.0,
+            phase=TurnPhase.SUBMITTED,
+            rag_service_user="svc_knowledge_employee",
+        )
+        assert await _active_turns.try_acquire(session_id, orphan)
+        try:
+            resp = await client.post(
+                SSE_STREAM_PATH.format(sid=session_id),
+                headers=await bearer_headers(token),
+                json={"question": "第二问"},
+            )
+            assert resp.status_code == 409
+            assert len(fake.query_calls) == 0  # 未提交新 /query
+            # 旧 Turn 未被静默释放（仍保留在 registry，recovering 已清除可重试）
+            record = await _active_turns.get(session_id)
+            assert record is not None
+            assert record.phase == TurnPhase.SUBMITTED
+            assert record.recovering is False
+            # 未发生重复/部分持久化
+            logs = list(
+                (
+                    await db_session.scalars(
+                        select(QaAccessLog).where(QaAccessLog.session_id == session_id)
+                    )
+                ).all()
+            )
+            assert len(logs) == 0
+        finally:
+            await _active_turns.release(session_id, "orphan-incomplete")
